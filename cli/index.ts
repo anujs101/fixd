@@ -1,5 +1,13 @@
 #!/usr/bin/env node
-import "dotenv/config";
+import { config as dotenvConfig } from "dotenv";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+
+// Load .env from the fixd package root (cli/../.env),
+// NOT from process.cwd() which changes depending on where the user runs fixd.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenvConfig({ path: path.resolve(__dirname, "../.env") });
+dotenvConfig({ path: path.resolve(__dirname, "../.env.local"), override: false }); // allow local overrides
 import chalk from "chalk";
 import { checkHealth } from "./lib/agent.js";
 import {

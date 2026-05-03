@@ -79,6 +79,11 @@ async function groqFetch(payload: GroqChatPayload, attempt = 0): Promise<Respons
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
+/** Strip <think>...</think> blocks emitted by Qwen3 extended-thinking mode */
+function stripThink(text: string): string {
+    return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+}
+
 /**
  * Single-turn completion. Returns the full response text.
  * Uses streaming internally for generate/diagnose to avoid timeout.
@@ -96,7 +101,7 @@ export async function ask(
 
     const res = await groqFetch({ model, messages, stream: false });
     const data = (await res.json()) as any;
-    return data.choices?.[0]?.message?.content ?? "";
+    return stripThink(data.choices?.[0]?.message?.content ?? "");
 }
 
 /**
@@ -157,7 +162,7 @@ export async function chat(messages: Message[], task: Task): Promise<string> {
 
     const res = await groqFetch({ model, messages, stream: false });
     const data = (await res.json()) as any;
-    return data.choices?.[0]?.message?.content ?? "";
+    return stripThink(data.choices?.[0]?.message?.content ?? "");
 }
 
 // ─── Exports for model info ───────────────────────────────────────────────────

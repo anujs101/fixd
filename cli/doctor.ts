@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import path from "node:path";
 import { sendMessage, disconnect } from "./lib/agent.js";
-import { askStream } from "./lib/llm.js";
+
 import { scanProject } from "../src/actions/scanFiles.js";
 import { detectIssues, type DetectedIssue } from "../src/actions/fixEnv.js";
 import { runDiagnostics, formatDiagnosticsForContext, getAllErrors } from "./lib/diagnostics.js";
@@ -133,6 +133,68 @@ function printDiagnosticsImmediate(diagResults: Awaited<ReturnType<typeof runDia
     console.log();
 }
 
+// ─── Render structured diagnosis response ────────────────────────────────────
+// Parses the LLM's structured block format and renders each issue using
+// display.ts primitives. Falls back to raw agentSays() if parsing fails.
+
+function renderDiagnosisResponse(raw: string, knownTypes: Set<string> = new Set()) {
+    // Strip any residual think blocks (defensive — llm.ts already does this)
+    const clean = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+
+    if (!clean || clean.toUpperCase() === "NO ISSUES FOUND") {
+        success("no issues found — project looks clean");
+        return;
+    }
+
+    // Parse issue blocks separated by ---
+    // First line may be "ISSUES: n found" — skip it
+    const blocks = clean.split(/^---$/m).map((b) => b.trim()).filter(Boolean);
+
+    let rendered = 0;
+    for (const block of blocks) {
+        if (!block.includes("SEVERITY:")) continue;
+
+        const get = (field: string) =>
+            block.match(new RegExp(`${field}:\\s*(.+)`))?.[1]?.trim() ?? "";
+
+        const severity = get("SEVERITY") as "HIGH" | "MEDIUM" | "LOW";
+        const type     = get("TYPE");
+        const problem  = get("PROBLEM");
+        const fix      = get("FIX");
+
+        if (!type && !problem) continue; // malformed block — skip
+
+        // Skip if this issue type was already rendered by the local detector
+        if (type && knownTypes.has(type)) continue;
+
+        // Extract ```diff ... ``` block and normalise indentation.
+        // printFix already adds 5-space indent per line, so strip leading
+        // whitespace from the raw diff to avoid double-indentation.
+        const diffMatch = block.match(/```diff\n([\s\S]*?)```/);
+        const diff = diffMatch
+            ? diffMatch[1]
+                .split("\n")
+                .map((l) => l.trimStart())
+                .join("\n")
+            : "";
+
+        console.log();
+        printIssue(severity || "MEDIUM", type || "UNKNOWN");
+        if (problem) console.log(`     ${chalk.dim("problem:")} ${problem}`);
+        if (fix)     console.log(`     ${chalk.dim("fix:    ")} ${fix}`);
+        if (diff)    printFix("suggested change:", diff);
+
+        rendered++;
+    }
+
+    // If the structured parse found nothing (model ignored format), fall back
+    if (rendered === 0 && blocks.every((b) => !b.includes("SEVERITY:"))) {
+        agentSays(clean);
+    }
+
+    console.log();
+}
+
 // ─── Main doctor flow ─────────────────────────────────────────────────────────
 
 export async function runDoctor() {
@@ -182,6 +244,10 @@ export async function runDoctor() {
     const autoFixable = issues.filter((i) => i.autoFixable);
     const manual = issues.filter((i) => !i.autoFixable);
 
+    // Build a set of locally-detected issue types so renderDiagnosisResponse
+    // can skip agent blocks that duplicate what's already shown locally.
+    const knownTypes = new Set(issues.map((i) => i.type));
+
     section("issues found");
     printDetectedIssues(issues);
 
@@ -193,9 +259,9 @@ export async function runDoctor() {
 
     const diagSpinner = spin("agent analysing...");
 
+    // Structured prompt — forces exact output format, prevents hallucination
     const diagPrompt = [
-        `You are fixd. The CLI has already scanned this project and ran real diagnostics.`,
-        `The data below is AUTHORITATIVE — do not guess or invent issues not listed here.`,
+        `You are fixd. Respond ONLY in the exact format below. No prose. No thinking out loud.`,
         ``,
         `SCAN DATA:`,
         "```",
@@ -205,12 +271,34 @@ export async function runDoctor() {
         `DETECTED ISSUES (${issues.length} total):`,
         issueList,
         ``,
+        `OUTPUT FORMAT — follow exactly, no deviations:`,
+        ``,
+        `ISSUES: {n} found`,
+        ``,
+        `---`,
+        `SEVERITY: HIGH | MEDIUM | LOW`,
+        `TYPE: {ISSUE_TYPE}`,
+        `PROBLEM: One sentence. What exactly is wrong.`,
+        `FIX: One sentence. Exact action to take.`,
+        `DIFF:`,
+        "\`\`\`diff",
+        `- old line`,
+        `+ new line`,
+        "\`\`\`",
+        `---`,
+        ``,
+        `(repeat block per issue)`,
+        ``,
+        `If no issues: respond with exactly "NO ISSUES FOUND"`,
+        ``,
         `RULES:`,
-        `- If TYPESCRIPT CHECK says PASSED, TypeScript is FINE. Do NOT say tsconfig is wrong.`,
-        `- Only mention issues that appear in the DETECTED ISSUES list above.`,
-        `- For each issue: state the exact file, line, error code, and what it means.`,
-        `- If no issues: say "No issues found" clearly.`,
-        `- No pleasantries. No filler. Be direct and specific.`,
+        `- No filler text before or after the blocks`,
+        `- No "I recommend", "Let me", "Okay", "First" or any conversational openers`,
+        `- Never suggest \`bun add\` or \`npm install\` for config fixes`,
+        `- For package.json fixes show JSON diff only, no install commands`,
+        `- If TYPESCRIPT CHECK says PASSED, TypeScript is FINE — do NOT mention tsconfig issues`,
+        `- Only mention issues that appear in the DETECTED ISSUES list above`,
+        `- Max 1 sentence per PROBLEM and FIX field`,
     ].join("\n");
 
     const diagResponse = await sendMessage(diagPrompt, "diagnose").catch((err: any) => {
@@ -222,7 +310,7 @@ export async function runDoctor() {
     diagSpinner.stop();
 
     for (const msg of diagResponse) {
-        agentSays(msg.text);
+        renderDiagnosisResponse(msg.text, knownTypes);
     }
 
     // ── Phase 4: apply fixes locally (no agent, real fs writes) ──────────
@@ -280,7 +368,9 @@ export async function runDoctor() {
             fixSummarySpinner.stop();
 
             for (const msg of fixSummary) {
-                agentSays(msg.text);
+                // strip think blocks from fix summary too
+                const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+                agentSays(clean);
             }
         }
     }
@@ -324,7 +414,19 @@ async function agenticTurn(
 
     const thinkSpinner = spin(depth === 0 ? "thinking..." : "agent analysing output...");
 
-    const responses = await sendMessage(withCwd(userMessage, projectPath), "chat").catch((err: any) => {
+    // Append format rules to keep chat responses terse and structured
+    const CHAT_FORMAT = [
+        "",
+        "",
+        "RESPOND FORMAT:",
+        "- Max 4 lines unless showing code",
+        "- If showing code: use fenced blocks with language tag",
+        "- No thinking out loud",
+        '- No "I will", "Let me", "Sure" openers',
+        "- Start answer directly",
+    ].join("\n");
+
+    const responses = await sendMessage(withCwd(userMessage + CHAT_FORMAT, projectPath), "chat").catch((err: any) => {
         thinkSpinner.stop();
         warn(err.message);
         return [];
@@ -333,7 +435,9 @@ async function agenticTurn(
     thinkSpinner.stop();
 
     for (const msg of responses) {
-        agentSays(msg.text);
+        // strip any residual think blocks before display
+        const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+        agentSays(clean);
 
         // ── Detect commands the agent wants to run ──────────────────────────────────
         const pending = extractPendingCommands(msg.text, alreadyRan);

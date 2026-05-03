@@ -1,224 +1,161 @@
-Here's the prompt:
+Two things to fix:
+1. Agent thinking out loud — that wall of "Okay, let's look at the problem..." is the model's <think> block leaking into output. Strip it in cli/lib/llm.ts before returning:
+typescript// strip <think>...</think> blocks from qwen3 responses
+response = response.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+2. bun add --dev scripts hallucination — model invented a fake command. Needs tighter prompt. In your diagnosis prompt add:
+RULES:
+- Never suggest `bun add` or `npm install` for fixing config issues
+- For package.json script fixes, show ONLY the JSON diff, no commands
+**Prompt:**
+
+```
+Fix the visual output of `fixd doctor` responses. The agent output is unstructured — 
+thinking text leaks, random prose, inconsistent formatting. 
+
+## Goal
+Every agent response must follow a strict visual structure. The display layer 
+(display.ts) already has all the primitives needed — use them.
+
+## Problem 1: <think> blocks leaking
+In `cli/lib/llm.ts`, strip before returning response:
+```typescript
+response = response.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+```
+
+## Problem 2: Agent prompt not enforcing structure
+The diagnosis prompt sent to LLM must enforce exact output format.
+Replace the current diagPrompt in `cli/doctor.ts` with this structure:
+
+```
+You are fixd. Respond ONLY in this exact format. No prose. No thinking out loud.
+
+ISSUES: {n} found
 
 ---
-
-**Prompt for your coding agent:**
-
+SEVERITY: HIGH | MEDIUM | LOW
+TYPE: {ISSUE_TYPE}
+PROBLEM: One sentence. What exactly is wrong.
+FIX: One sentence. Exact action to take.
+DIFF:
+```diff
+- old line
++ new line
 ```
-You are refactoring the `fixd` CLI project to remove all ElizaOS dependencies and replace them with direct Groq API calls.
+---
 
-## Context
-fixd is a terminal-native developer environment agent. It has three commands:
-- `fixd doctor` — scans project, detects issues, fixes them, interactive chat
-- `fixd init` — scaffolds new project via conversation
-- `fixd deploy` — deploys to Nosana GPU network
+(repeat block per issue)
 
-Currently the CLI talks to an ElizaOS server via Socket.IO. We are ripping that out entirely and talking to Groq directly.
+If no issues: respond with exactly "NO ISSUES FOUND"
 
-## What to remove
-- `cli/lib/client.ts` — delete entirely (Socket.IO + ElizaOS messaging)
-- All `socket.io-client` usage
-- All `elizaos dev` server dependency
-- `src/index.ts` plugin — delete (ElizaOS action system no longer needed)
-- `src/actions/` folder — keep the logic but detach from ElizaOS types
-- Any `@elizaos/core` imports anywhere in `cli/`
-
-## What to keep
-- `characters/agent.character.json` — keep as-is, convert to system prompt
-- `cli/lib/display.ts` — keep entirely, no changes
-- `cli/lib/diagnostics.ts` — keep entirely, no changes
-- `cli/lib/executor.ts` — keep entirely, no changes
-- `src/actions/scanFiles.ts` — keep, remove any ElizaOS imports
-- `src/actions/executeCommand.ts` — keep, remove any ElizaOS imports
-- `src/actions/fixEnv.ts` — keep, remove any ElizaOS imports
-- `cli/doctor.ts` — keep structure, replace `sendMessage()` calls
-- `cli/init.ts` — keep structure, replace `sendMessage()` calls
-- `cli/deploy.ts` — keep structure, replace `sendMessage()` calls
-- `cli/index.ts` — keep, remove preflight Socket.IO check
-
-## What to build: `cli/lib/llm.ts`
-
-Create a new LLM client that talks directly to Groq. Requirements:
-
-```typescript
-// Two models — route by task
-const SMALL_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"; // classify, explain, short answers
-const LARGE_MODEL = "qwen/qwen3-32b"; // codegen, scaffold, complex diagnosis
-
-type Task = "classify" | "explain" | "generate" | "diagnose" | "chat";
-
-// Core function — streaming for generate tasks, regular for others
-async function ask(
-  prompt: string,
-  task: Task,
-  systemPrompt?: string
-): Promise<string>
-
-// Streaming variant — yields chunks for real-time display
-async function* askStream(
-  prompt: string,
-  task: Task,
-  systemPrompt?: string
-): AsyncGenerator<string>
-
-// Multi-turn conversation support
-interface Message { role: "user" | "assistant" | "system"; content: string; }
-async function chat(messages: Message[], task: Task): Promise<string>
+RULES:
+- No filler text before or after the blocks
+- No "I recommend", "Let me", "Okay", "First" or any conversational openers
+- No fake commands (never suggest `bun add` for config fixes)
+- For package.json fixes show JSON diff only
+- Max 1 sentence per field
 ```
 
-Model routing logic:
-- `generate` → LARGE_MODEL
-- `diagnose` → LARGE_MODEL  
-- `classify` → SMALL_MODEL
-- `explain` → SMALL_MODEL
-- `chat` → SMALL_MODEL, upgrade to LARGE if message contains code generation intent
-
-Groq endpoint: `https://api.groq.com/openai/v1` (OpenAI-compatible)
-Auth: `process.env.GROQ_API_KEY`
-Error handling: retry once on 429, throw with clean message on others.
-
-## What to build: `cli/lib/agent.ts`
-
-Replaces `client.ts`. Wraps `llm.ts` with fixd-specific context management.
+## Problem 3: Parse structured response in display layer
+In `cli/doctor.ts`, after getting agent response, parse the structured blocks
+and render using existing display.ts primitives instead of raw `agentSays()`:
 
 ```typescript
-// Load system prompt from character JSON
-function loadSystemPrompt(): string
-// Takes characters/agent.character.json, extracts:
-// - system field
-// - bio array (join as paragraph)
-// - style.all + style.chat rules
-// Combines into one system prompt string
+function renderDiagnosisResponse(raw: string) {
+  // strip think blocks
+  const clean = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  
+  if (clean === "NO ISSUES FOUND") {
+    success("no issues found — project looks clean");
+    return;
+  }
 
-// Session-level conversation history
-const history: Message[] = [];
+  // parse issue blocks separated by ---
+  const blocks = clean.split(/^---$/m).map(b => b.trim()).filter(Boolean);
+  
+  for (const block of blocks) {
+    if (!block.includes("SEVERITY:")) continue;
+    
+    const get = (field: string) =>
+      block.match(new RegExp(`${field}:\\s*(.+)`))?.[1]?.trim() ?? "";
 
-// Send a message, get response — drop-in replacement for old sendMessage()
-async function sendMessage(text: string): Promise<AgentResponse[]>
+    const severity = get("SEVERITY") as "HIGH" | "MEDIUM" | "LOW";
+    const type     = get("TYPE");
+    const problem  = get("PROBLEM");
+    const fix      = get("FIX");
 
-// Same interface as old client.ts AgentResponse
-interface AgentResponse {
-  text: string;
-  actions?: string[];
-}
+    // extract diff block
+    const diffMatch = block.match(/```diff\n([\s\S]*?)```/);
+    const diff      = diffMatch?.[1] ?? "";
 
-// Reset conversation (new doctor/init session)
-function resetSession(): void
-
-// Health check — just verify GROQ_API_KEY exists and API responds
-async function checkHealth(): Promise<boolean>
-```
-
-Conversation history rules:
-- Keep last 20 messages max (sliding window)
-- Always include system prompt as first message
-- On `resetSession()`, clear history but keep system prompt
-
-## Update `cli/index.ts`
-
-Replace the `preflight()` function:
-- Old: checks if ElizaOS Socket.IO server is reachable
-- New: checks if `GROQ_API_KEY` is set in env, calls `checkHealth()` from `agent.ts`
-- If key missing: print clear error "set GROQ_API_KEY in your .env" and exit
-
-Remove:
-- `getAgentId()` import
-- Any Socket.IO or ElizaOS server references in status command
-
-Update `fixd status` to show:
-- Groq API reachable: yes/no
-- Active model (small + large)
-- Current project path
-
-## Update `cli/doctor.ts`
-
-Replace all `sendMessage()` calls — import from `./lib/agent.js` instead of `./lib/client.js`. Pass task type:
-
-```typescript
-// diagnosis explanation → task: "diagnose"
-const diagResponse = await sendMessage(diagPrompt, "diagnose");
-
-// fix summary → task: "explain"  
-const fixSummary = await sendMessage(fixSummaryPrompt, "explain");
-
-// interactive chat → task: "chat"
-const responses = await sendMessage(userMessage, "chat");
-```
-
-Add direct diagnostics display BEFORE sending to agent (this is important — show tsc errors
-immediately from local runner, don't wait for LLM):
-
-After `runDiagnostics()` resolves, iterate `diagResults` and print directly to terminal using
-existing display functions (`success`, `warn`, `info`). Show file:line:col:code for each error.
-This gives instant feedback regardless of LLM speed.
-
-## Update `cli/init.ts`
-
-Replace `sendMessage()` import. Add streaming for scaffold generation:
-
-```typescript
-// use askStream for file generation — show output as it arrives
-for await (const chunk of askStream(scaffoldPrompt, "generate")) {
-  process.stdout.write(chunk);
+    // render using display.ts primitives
+    console.log();
+    printIssue(severity, type);
+    console.log(`     ${chalk.dim("problem:")} ${problem}`);
+    console.log(`     ${chalk.dim("fix:")}     ${fix}`);
+    
+    if (diff) {
+      printFix("suggested change:", diff);
+    }
+  }
+  console.log();
 }
 ```
 
-After streaming completes, parse the response for file blocks and write them to disk:
-- Detect ```filename.ext ... ``` blocks in response
-- Write each to `process.cwd()/${projectName}/filename.ext`
-- Create directories as needed
-- Run `git init && git add . && git commit -m "init: fixd scaffold"` after all files written
+Replace `agentSays(msg.text)` in the diagnosis phase with `renderDiagnosisResponse(msg.text)`.
+Keep `agentSays()` for interactive chat phase only.
 
-## Update `cli/deploy.ts`
+## Problem 4: Chat phase output still needs cleanup
+In the interactive chat loop, before calling `agentSays()`, strip think blocks:
 
-Keep the Nosana deploy flow but replace agent call with direct structured prompt.
-Do not add @nosana/kit yet — that's a separate task.
-
-## Environment variables
-
-Add to `.env.example`:
-```env
-# LLM
-GROQ_API_KEY=your_key_here
-SMALL_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
-LARGE_MODEL=qwen/qwen3-32b
-
-# Agent server (no longer needed after ElizaOS removal)
-# FIXD_AGENT_URL=http://localhost:3000
+```typescript
+const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+agentSays(clean);
 ```
 
-## Package.json changes
+## Problem 5: Chat prompt needs structure rule too
+When sending chat messages in `agenticTurn()`, append to every message:
 
-Remove:
-- `socket.io-client`
-- `@elizaos/core`
-- `@elizaos/plugin-bootstrap`
-- `@elizaos/plugin-openai`
-- `@elizaos/cli` (devDep)
+```
+\n\nRESPOND FORMAT:
+- Max 4 lines unless showing code
+- If showing code: use fenced blocks with language tag
+- No thinking out loud
+- No "I will", "Let me", "Sure" openers
+- Start answer directly
+```
 
-Keep everything else. Add:
-- No new deps needed — Groq uses native fetch (Node 18+)
+## Expected output after fix
+
+```
+  issues found
+  ────────────────────────────────────────
+
+  ●  MEDIUM   MISSING_SCRIPTS
+     problem: package.json has no "dev" or "start" script defined
+     fix:     add "start" script pointing to your entry point
+
+     → suggested change:
+     - (no start script)
+     + "start": "tsx cli/index.ts"
+
+
+  ℹ No auto-fixable issues.
+
+  chat mode
+  ────────────────────────────────────────
+
+  ? you › why is strict mode important
+
+  fixd › Strict mode enables additional TypeScript checks:
+         - catches implicit any
+         - enforces null checks  
+         - prevents unsafe operations
+         Recommended for all production TypeScript projects.
+```
 
 ## Do not touch
-- `cli/lib/display.ts`
+- `cli/lib/display.ts` — only consume it, don't modify
 - `cli/lib/diagnostics.ts`
 - `cli/lib/executor.ts`
-- `src/actions/scanFiles.ts`
-- `src/actions/executeCommand.ts`
-- `src/actions/fixEnv.ts`
-- `characters/agent.character.json`
-- `Dockerfile`
-- `nos_job_def/`
-
-## Verification
-
-After refactor, this should work with zero background processes:
-```bash
-# no elizaos dev needed
-bun fixd status   # shows groq connected
-bun fixd doctor   # full flow, direct groq calls
-```
-
-The old flow was: CLI → Socket.IO → ElizaOS server → Ollama
-The new flow is:  CLI → Groq API (direct)
+- `src/actions/`
 ```
