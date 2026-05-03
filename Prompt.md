@@ -1,227 +1,324 @@
 ```
-Build Context7 integration for fixd CLI. Context7 provides up-to-date library 
-documentation via API — fixes the problem of LLMs generating stale/outdated code.
+Fix three issues in the fixd CLI project.
 
-## Context
-fixd is a terminal-native dev environment agent. Stack:
-- `cli/lib/llm.ts` — Groq LLM client
-- `cli/lib/agent.ts` — conversation management, system prompt
-- `cli/lib/display.ts` — terminal UI primitives
-- `cli/doctor.ts` — main doctor flow with agenticTurn()
-- `cli/init.ts` — project scaffolding
+## Fix 1: Conversation memory across sessions
 
-CONTEXT7_API_KEY is already in .env.
+### Problem
+Every `fixd doctor` run starts cold. Agent has no memory of previous sessions,
+previously fixed issues, or project history.
 
-## What to build: `cli/lib/context7.ts`
+### Solution
+Build a simple persistent memory layer using a local JSON file at
+`{projectRoot}/.fixd/memory.json`. Not a database. Not embeddings. Just structured
+JSON that gets injected into every LLM system prompt.
 
-```typescript
-const BASE_URL = "https://context7.com/api/v1";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface LibraryDoc {
-  libraryId: string;      // e.g. "/honojs/hono"
-  topic: string;          // e.g. "routing" — what we asked for
-  content: string;        // markdown doc content
-  version: string | null; // library version if returned
-  tokens: number;         // content token count
-}
-
-export interface Context7Result {
-  docs: LibraryDoc[];
-  totalTokens: number;
-  skipped: string[];      // libraries that failed or returned nothing
-}
-
-// ─── Library ID map ───────────────────────────────────────────────────────────
-// Maps common names from fixd init interview → Context7 library IDs
-// If not found in map, use search API to resolve dynamically
-
-const KNOWN_LIBRARIES: Record<string, string> = {
-  // frameworks
-  "hono":          "/honojs/hono",
-  "express":       "/expressjs/express",
-  "fastify":       "/fastify/fastify",
-  "nextjs":        "/vercel/next.js",
-  "next":          "/vercel/next.js",
-  "vite":          "/vitejs/vite",
-
-  // ORMs / DB
-  "prisma":        "/prisma/prisma",
-  "drizzle":       "/drizzle-team/drizzle-orm",
-
-  // auth
-  "better-auth":   "/better-auth/better-auth",
-  "clerk":         "/clerkinc/clerk-docs",
-
-  // runtime
-  "bun":           "/oven-sh/bun",
-
-  // nosana
-  "nosana":        "/nosana-ci/nosana-node",
-};
-```
-
-### Functions to implement
-
-**`resolveLibraryId(name: string): Promise<string | null>`**
-
-Resolve library name to Context7 ID.
-1. Check `KNOWN_LIBRARIES` map first (instant)
-2. If not found, call `GET /api/v1/search?q={name}&limit=3`
-3. Parse response, pick first result with `code_snippet_count > 0`
-4. Return `libraryId` or null if nothing found
-5. Cache resolved IDs in memory (Map) for session duration
-
-**`fetchDocs(libraryId: string, topic: string, maxTokens = 4000): Promise<LibraryDoc | null>`**
-
-Fetch docs for a specific library + topic.
-```
-GET https://context7.com/api/v1{libraryId}?topic={topic}&tokens={maxTokens}
-Headers:
-  X-Context7-Source: fixd
-  Authorization: Bearer {process.env.CONTEXT7_API_KEY}
-```
-- Return null on 404 or empty content
-- Return null on error (never throw — log with `warn()`)
-- Strip excessive whitespace from content before returning
-
-**`fetchDocsForStack(stack: StackChoices): Promise<Context7Result>`**
-
-Called during `fixd init` after interview. Fetches docs for all chosen libraries.
+### Build `cli/lib/memory.ts`
 
 ```typescript
-interface StackChoices {
-  framework?: string;   // "hono", "express", etc.
-  orm?: string;         // "prisma", "drizzle"
-  auth?: string;        // "better-auth", "clerk"
-  runtime?: string;     // "bun", "node"
-  database?: string;    // used to pick relevant prisma topics
+export interface ProjectMemory {
+  projectRoot: string;
+  lastScanned: string | null;          // ISO timestamp
+  fixedIssues: FixedIssue[];
+  knownStack: Partial<StackSnapshot>;
+  chatSummaries: ChatSummary[];        // rolling summaries of past sessions
+  userPreferences: Record<string, string>; // e.g. { "preferred_pkg_manager": "bun" }
+}
+
+interface FixedIssue {
+  type: string;
+  description: string;
+  fixedAt: string;        // ISO timestamp
+  filesChanged: string[];
+}
+
+interface StackSnapshot {
+  packageManager: string;
+  nodeVersion: string;
+  frameworks: string[];
+  orms: string[];
+  databases: string[];
+}
+
+interface ChatSummary {
+  sessionDate: string;    // ISO timestamp
+  summary: string;        // 2-3 sentence summary of what happened
+  filesChanged: string[];
 }
 ```
 
-Topic selection logic per library:
-- `hono` → topic: "getting started routing middleware"
-- `express` → topic: "routing middleware setup"
-- `prisma` + postgres → topic: "postgresql connection schema migrations"
-- `prisma` + neon → topic: "neon serverless connection pooling directUrl"
-- `drizzle` → topic: "schema migrations postgresql"
-- `better-auth` → topic: "setup nextjs configuration"
-- `bun` → topic: "http server file runtime"
+Functions:
 
-Fetch all in parallel with `Promise.allSettled`.
-Cap total tokens at 12000 — if over, trim least important libs first (auth < runtime < orm < framework).
+**`loadMemory(projectRoot: string): Promise<ProjectMemory>`**
+- Read `.fixd/memory.json`
+- Return empty ProjectMemory if file doesn't exist
+- Never throw
 
-**`detectLibrariesInProject(projectPath: string): Promise<string[]>`**
+**`saveMemory(memory: ProjectMemory): Promise<void>`**
+- Create `.fixd/` dir if needed
+- Write atomically (tmp → rename)
+- Never throw
 
-Called during `fixd doctor` chat to auto-detect what docs to fetch.
-Read `package.json` dependencies + devDependencies, map to library IDs using `KNOWN_LIBRARIES`.
-Return list of resolved library IDs found.
+**`updateFromScan(memory: ProjectMemory, scan: ProjectScan): ProjectMemory`**
+- Update `lastScanned`, `knownStack` from scan result
+- Return updated memory (don't save — caller saves)
 
-**`fetchDocsForQuery(query: string, projectLibraries: string[]): Promise<LibraryDoc[]>`**
+**`recordFix(memory: ProjectMemory, results: PatchResult[]): ProjectMemory`**
+- Append each applied fix to `fixedIssues`
+- Cap `fixedIssues` at 50 entries (drop oldest)
+- Return updated memory
 
-Called in `agenticTurn()` when user asks about a library.
-1. Extract library name from query (simple keyword match against KNOWN_LIBRARIES keys)
-2. If match found and in projectLibraries: fetch with query as topic
-3. Cap at 3000 tokens per doc, max 2 docs per query
-4. Return empty array if nothing relevant (never block the response)
+**`summarizeSession(memory: ProjectMemory, sessionLog: string): Promise<ProjectMemory>`**
+- Call LLM with `task: "classify"` (small model, cheap):
+  ```
+  Summarize this fixd session in 2 sentences max. What was broken, what was fixed.
+  Session log: {sessionLog}
+  ```
+- Append result to `chatSummaries`
+- Cap `chatSummaries` at 10 entries
+- Return updated memory
 
-**`formatDocsForPrompt(docs: LibraryDoc[]): string`**
-
-Convert docs to injection string for LLM prompt:
-```
---- CURRENT LIBRARY DOCUMENTATION ---
-The following is up-to-date documentation fetched in real time.
-Prefer this over your training data for these libraries.
-
-[LIBRARY: honojs/hono — routing]
-{content}
-
-[LIBRARY: prisma/prisma — neon connection]
-{content}
---- END DOCUMENTATION ---
-```
-
-### Integration: `cli/init.ts`
-
-After stack interview, before sending scaffold prompt to LLM:
-
-```typescript
-import { fetchDocsForStack, formatDocsForPrompt } from "./lib/context7.js";
-
-// after confirm("scaffold this project?"):
-const docsSpinner = spin("fetching latest docs...");
-const docsResult = await fetchDocsForStack({
-  framework: framework || "hono",
-  orm: orm !== "none" ? orm : undefined,
-  auth: auth !== "none" ? auth : undefined,
-  runtime: pkgManager === "bun" ? "bun" : "node",
-  database: database !== "none" ? database : undefined,
-}).catch(() => ({ docs: [], totalTokens: 0, skipped: [] }));
-docsSpinner.stop();
-
-if (docsResult.docs.length > 0) {
-  info(`fetched docs for: ${docsResult.docs.map(d => d.libraryId.split("/")[2]).join(", ")}`);
-}
-if (docsResult.skipped.length > 0) {
-  info(`skipped (no docs found): ${docsResult.skipped.join(", ")}`);
-}
-
-const docsContext = formatDocsForPrompt(docsResult.docs);
-
-// inject into scaffold prompt:
-const scaffoldPrompt = `
-${docsContext}
-
-Scaffold a new project with these specs:
-- Project name: ${projectName}
-...rest of existing prompt
-`.trim();
-```
-
-### Integration: `cli/doctor.ts` — chat mode
-
-In `agenticTurn()`, detect if user query references a known library and inject docs:
-
-```typescript
-import { detectLibrariesInProject, fetchDocsForQuery, formatDocsForPrompt } from "./lib/context7.js";
-
-// at top of runDoctor(), after scan:
-const projectLibraries = await detectLibrariesInProject(projectPath)
-  .catch(() => [] as string[]);
-
-// in agenticTurn(), before sendMessage():
-async function buildMessageWithDocs(userMessage: string): Promise<string> {
-  const docs = await fetchDocsForQuery(userMessage, projectLibraries)
-    .catch(() => [] as LibraryDoc[]);
+**`formatMemoryForPrompt(memory: ProjectMemory): string`**
+- Returns empty string if memory is essentially empty
+- Otherwise returns:
+  ```
+  --- PROJECT MEMORY ---
+  Last scanned: {lastScanned}
+  Stack: {frameworks}, {orms}, {packageManager}
   
-  if (docs.length === 0) return userMessage;
+  Previously fixed:
+  - {type}: {description} (fixed {date})
   
-  const docsContext = formatDocsForPrompt(docs);
-  return `${docsContext}\n\n${userMessage}`;
+  Past sessions:
+  - {date}: {summary}
+  --- END MEMORY ---
+  ```
+- Keep under 500 tokens total — truncate old fixes if needed
+
+### Integration: `cli/lib/agent.ts`
+
+```typescript
+import { loadMemory, formatMemoryForPrompt } from "./memory.js";
+
+// in sendMessage() or buildSystemPrompt():
+const memory = await loadMemory(process.cwd());
+const memoryContext = formatMemoryForPrompt(memory);
+
+// prepend to system prompt:
+const fullSystemPrompt = memoryContext
+  ? `${memoryContext}\n\n${baseSystemPrompt}`
+  : baseSystemPrompt;
+```
+
+### Integration: `cli/doctor.ts`
+
+```typescript
+import { loadMemory, saveMemory, updateFromScan, recordFix, summarizeSession } from "./lib/memory.js";
+
+// at start of runDoctor():
+const memory = await loadMemory(projectPath);
+
+// after scan:
+const updatedMemory = updateFromScan(memory, scan);
+await saveMemory(updatedMemory);
+
+// after fixes applied (in the fix loop):
+const memoryAfterFix = recordFix(updatedMemory, allPatchResults);
+await saveMemory(memoryAfterFix);
+
+// at end of session (before bye()):
+// collect sessionLog = all agent responses + user inputs concatenated
+const finalMemory = await summarizeSession(memoryAfterFix, sessionLog);
+await saveMemory(finalMemory);
+```
+
+Add `.fixd/` to `.gitignore` — project memory is local, not committed.
+
+---
+
+## Fix 2: Groq 429 rate limit handling
+
+### Problem
+Groq free tier hits rate limits. Currently unhandled — crashes with unreadable error.
+
+### Solution
+In `cli/lib/llm.ts`, wrap every API call with retry + backoff + clear user messaging.
+
+```typescript
+// Replace current fetch call with this wrapper:
+
+interface GroqError {
+  error: {
+    message: string;
+    type: string;
+    code: string;
+  };
 }
 
-// replace: sendMessage(withCwd(injectCommandInstruction(userMessage), projectPath))
-// with:
-const enrichedMessage = await buildMessageWithDocs(
-  withCwd(injectCommandInstruction(userMessage), projectPath)
-);
-const responses = await sendMessage(enrichedMessage, "chat").catch(...);
+async function groqFetch(
+  body: object,
+  retries = 3
+): Promise<Response> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const res = await fetch(`${GROQ_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.ok) return res;
+
+    if (res.status === 429) {
+      // parse retry-after header if present
+      const retryAfter = res.headers.get("retry-after");
+      const waitSeconds = retryAfter ? parseInt(retryAfter) : attempt * 15;
+
+      if (attempt < retries) {
+        // show spinner with countdown
+        const s = spin(`rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
+        await sleep(waitSeconds * 1000);
+        s.stop();
+        continue;
+      }
+
+      // final attempt failed
+      throw new Error(
+        `Groq rate limit exceeded. Wait ${waitSeconds}s and retry.\n` +
+        `Tip: reduce usage or upgrade at console.groq.com`
+      );
+    }
+
+    if (res.status === 401) {
+      throw new Error("Invalid GROQ_API_KEY. Check your .env file.");
+    }
+
+    if (res.status === 503 || res.status === 502) {
+      if (attempt < retries) {
+        const wait = attempt * 5;
+        const s = spin(`Groq unavailable — retrying in ${wait}s...`);
+        await sleep(wait * 1000);
+        s.stop();
+        continue;
+      }
+      throw new Error("Groq API is currently unavailable. Try again in a moment.");
+    }
+
+    // other errors — parse and throw clean message
+    const errBody = await res.json().catch(() => null) as GroqError | null;
+    throw new Error(
+      errBody?.error?.message ?? `Groq API error ${res.status}`
+    );
+  }
+
+  throw new Error("Groq request failed after all retries.");
+}
 ```
 
-### Environment
+Also add startup validation in `cli/index.ts`:
 
-Add to `.env.example`:
-```env
-# Context7
-CONTEXT7_API_KEY=your_key_here
-```
-
-Add to `.env` validation in `cli/index.ts` startup:
 ```typescript
-// warn but don't exit — context7 is optional enhancement
-if (!process.env.CONTEXT7_API_KEY) {
-  warn("CONTEXT7_API_KEY not set — library docs unavailable");
+// in preflight() after checkHealth():
+async function validateGroqKey(): Promise<boolean> {
+  if (!process.env.GROQ_API_KEY) {
+    error("GROQ_API_KEY not set — add it to your .env file");
+    info("get a free key at console.groq.com");
+    return false;
+  }
+
+  // lightweight test call — 1 token, cheapest model
+  try {
+    await ask("hi", "classify");
+    return true;
+  } catch (err: any) {
+    error(`Groq API error: ${err.message}`);
+    return false;
+  }
+}
+```
+
+Add model fallback — if large model (qwen3-32b) fails, retry with small model:
+
+```typescript
+// in ask() for task === "generate" or "diagnose":
+try {
+  return await groqFetch({ model: LARGE_MODEL, ...body });
+} catch (err: any) {
+  if (err.message.includes("rate limit") || err.message.includes("unavailable")) {
+    warn(`${LARGE_MODEL} unavailable — falling back to ${SMALL_MODEL}`);
+    return await groqFetch({ model: SMALL_MODEL, ...body });
+  }
+  throw err;
+}
+```
+
+---
+
+## Fix 3: Verify step after auto-fix
+
+### Problem
+After fixes are applied, fixd never confirms the project is actually clean.
+User has no way to know if the fixes worked without manually re-running.
+
+### Solution
+After fix loop in `cli/doctor.ts`, re-run scan + diagnostics and compare.
+
+```typescript
+// after fix loop, before dropping into chat mode:
+
+if (autoFixable.length > 0 && shouldFix) {
+  const verifySpinner = spin("verifying fixes...");
+
+  // re-run full scan + diagnostics
+  const [scanAfter, diagAfter] = await Promise.all([
+    scanProject(projectPath).catch(() => null),
+    runDiagnostics(projectPath).catch(() => []),
+  ]);
+
+  verifySpinner.stop();
+  section("verification");
+
+  if (!scanAfter) {
+    warn("could not re-scan project — verify manually");
+  } else {
+    const issuesAfter = detectIssues(scanAfter, projectPath);
+    const diagErrorsAfter = getAllErrors(diagAfter);
+
+    // compare before vs after
+    const resolvedCount = issues.length - issuesAfter.length;
+    const newIssueCount = issuesAfter.filter(
+      a => !issues.some(b => b.type === a.type)
+    ).length;
+
+    if (resolvedCount > 0) {
+      success(`${resolvedCount} issue${resolvedCount > 1 ? "s" : ""} resolved`);
+    }
+
+    if (newIssueCount > 0) {
+      warn(`${newIssueCount} new issue${newIssueCount > 1 ? "s" : ""} detected after fix`);
+      for (const i of issuesAfter.filter(a => !issues.some(b => b.type === a.type))) {
+        printIssue(i.severity, i.type);
+        console.log(`     ${chalk.dim(i.description)}`);
+      }
+    }
+
+    if (diagErrorsAfter.length === 0 && issuesAfter.length === 0) {
+      success("project is clean");
+    } else if (diagErrorsAfter.length > 0) {
+      warn(`${diagErrorsAfter.length} diagnostic error${diagErrorsAfter.length > 1 ? "s" : ""} remain`);
+      for (const e of diagErrorsAfter.slice(0, 5)) {
+        const loc = e.file ? `${e.file}:${e.line ?? ""}` : "";
+        console.log(`     ${chalk.dim(loc)} ${chalk.red(e.code ?? "")} ${e.message}`);
+      }
+    }
+
+    // update memory with verify result
+    if (scanAfter) {
+      const verifiedMemory = updateFromScan(memory, scanAfter);
+      await saveMemory(verifiedMemory);
+    }
+  }
 }
 ```
 
@@ -230,30 +327,6 @@ if (!process.env.CONTEXT7_API_KEY) {
 - `cli/lib/diagnostics.ts`
 - `cli/lib/executor.ts`
 - `cli/lib/patcher.ts`
+- `cli/lib/context7.ts`
 - `src/actions/`
-
-## Verification
-
-```
-fixd init
-
-  ? backend framework (hono / express / fastify) › hono
-  ? orm (prisma / drizzle / none) › prisma
-  ? postgres hosting (neon / supabase / railway / local) › neon
-  ...
-
-  ⠋ fetching latest docs...
-  ℹ fetched docs for: hono, prisma
-  ℹ skipped (no docs found): (none)
-
-  ⠋ generating project...
-  [streams files with current hono v4 syntax + correct neon+prisma config]
-```
-
-And in doctor chat:
-```
-  ? you › how do i add middleware in hono
-
-  [auto-fetches hono middleware docs, injects, responds with current v4 syntax]
-```
 ```

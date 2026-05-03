@@ -2,7 +2,13 @@
 // Talks directly to Groq's OpenAI-compatible API.
 // No background server needed — just a GROQ_API_KEY in .env
 
+import { spin, warn } from "./display.js";
+
 const GROQ_BASE_URL = "https://api.groq.com/openai/v1";
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 // Two models — routed by task type
 const SMALL_MODEL =
@@ -52,29 +58,58 @@ interface GroqChatPayload {
     max_tokens?: number;
 }
 
-async function groqFetch(payload: GroqChatPayload, attempt = 0): Promise<Response> {
-    const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${getApiKey()}`,
-        },
-        body: JSON.stringify(payload),
-    });
+interface GroqError {
+    error: { message: string; type: string; code: string };
+}
 
-    // Retry once on rate-limit
-    if (res.status === 429 && attempt === 0) {
-        const retryAfter = parseInt(res.headers.get("retry-after") ?? "2", 10);
-        await new Promise((r) => setTimeout(r, retryAfter * 1000));
-        return groqFetch(payload, 1);
+async function groqFetch(payload: GroqChatPayload, retries = 3): Promise<Response> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${getApiKey()}`,
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (res.ok) return res;
+
+        if (res.status === 429) {
+            const retryAfter = res.headers.get("retry-after");
+            const waitSeconds = retryAfter ? parseInt(retryAfter, 10) : attempt * 15;
+            if (attempt < retries) {
+                const s = spin(`rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
+                await sleep(waitSeconds * 1000);
+                s.stop();
+                continue;
+            }
+            throw new Error(
+                `Groq rate limit exceeded. Wait ${waitSeconds}s and retry.\n` +
+                `Tip: reduce usage or upgrade at console.groq.com`
+            );
+        }
+
+        if (res.status === 401) {
+            throw new Error("Invalid GROQ_API_KEY. Check your .env file.");
+        }
+
+        if (res.status === 503 || res.status === 502) {
+            if (attempt < retries) {
+                const wait = attempt * 5;
+                const s = spin(`Groq unavailable — retrying in ${wait}s...`);
+                await sleep(wait * 1000);
+                s.stop();
+                continue;
+            }
+            throw new Error("Groq API is currently unavailable. Try again in a moment.");
+        }
+
+        const errBody = await res.json().catch(() => null) as GroqError | null;
+        throw new Error(errBody?.error?.message ?? `Groq API error ${res.status}`);
     }
 
-    if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`Groq API error ${res.status}: ${body}`);
-    }
-
-    return res;
+    throw new Error("Groq request failed after all retries.");
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -98,6 +133,23 @@ export async function ask(
     messages.push({ role: "user", content: prompt });
 
     const model = pickModel(task, prompt);
+
+    // For heavy tasks: try large model first, fall back to small on rate-limit/unavailability
+    if (task === "generate" || task === "diagnose") {
+        try {
+            const res = await groqFetch({ model: LARGE_MODEL, messages, stream: false });
+            const data = (await res.json()) as any;
+            return stripThink(data.choices?.[0]?.message?.content ?? "");
+        } catch (err: any) {
+            if (err.message.includes("rate limit") || err.message.includes("unavailable")) {
+                warn(`${LARGE_MODEL} unavailable — falling back to ${SMALL_MODEL}`);
+                const res = await groqFetch({ model: SMALL_MODEL, messages, stream: false });
+                const data = (await res.json()) as any;
+                return stripThink(data.choices?.[0]?.message?.content ?? "");
+            }
+            throw err;
+        }
+    }
 
     const res = await groqFetch({ model, messages, stream: false });
     const data = (await res.json()) as any;

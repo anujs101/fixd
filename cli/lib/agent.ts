@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { chat, ask, type Message, type Task } from "./llm.js";
+import { loadMemory, formatMemoryForPrompt } from "./memory.js";
 
 // ─── System prompt — built from characters/agent.character.json ───────────────
 
@@ -102,10 +103,17 @@ export async function sendMessage(
 ): Promise<AgentResponse[]> {
     history.push({ role: "user", content: text });
 
+    // Inject persistent project memory into the system prompt
+    const memory = await loadMemory(process.cwd());
+    const memoryContext = formatMemoryForPrompt(memory);
+    const fullSystemPrompt = memoryContext
+        ? `${memoryContext}\n\n${SYSTEM_PROMPT}`
+        : SYSTEM_PROMPT;
+
     // Build full message array: system + history (capped at MAX_HISTORY)
     const trimmed = history.slice(-MAX_HISTORY);
     const messages: Message[] = [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: fullSystemPrompt },
         ...trimmed,
     ];
 

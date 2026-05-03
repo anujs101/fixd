@@ -3,6 +3,14 @@ import path from "node:path";
 import { sendMessage, disconnect } from "./lib/agent.js";
 import { proposeAndApply } from "./lib/patcher.js";
 import {
+    loadMemory,
+    saveMemory,
+    updateFromScan,
+    recordFix,
+    summarizeSession,
+    type AppliedFix,
+} from "./lib/memory.js";
+import {
     detectLibrariesInProject,
     fetchDocsForQuery,
     formatDocsForPrompt,
@@ -211,6 +219,10 @@ export async function runDoctor() {
     info(`scanning project at ${chalk.white(projectPath)}`);
     console.log();
 
+    // Load persistent memory for this project
+    let currentMemory = await loadMemory(projectPath);
+    const sessionLog: string[] = [];
+
     // ── Phase 1: local scan + real diagnostics (deterministic, no LLM) ───────────
     const scanSpinner = spin("scanning project files...");
     let scan: Awaited<ReturnType<typeof scanProject>>;
@@ -222,6 +234,10 @@ export async function runDoctor() {
         process.exit(1);
     }
     scanSpinner.stop();
+
+    // Update memory with scan result
+    currentMemory = updateFromScan(currentMemory, scan);
+    await saveMemory(currentMemory);
 
     // ── Detect project libraries for Context7 doc injection ──────────────────
     const projectLibraries = await detectLibrariesInProject(projectPath).catch(() => [] as string[]);
@@ -333,6 +349,7 @@ export async function runDoctor() {
             section("applying fixes");
 
             const fixedDescriptions: string[] = [];
+            const appliedFixes: AppliedFix[] = [];
 
             for (const issue of autoFixable) {
                 const fixSpinner = spin(`fixing ${issue.type}...`);
@@ -342,6 +359,11 @@ export async function runDoctor() {
                     if (result.applied) {
                         printFix(result.description, result.diff);
                         fixedDescriptions.push(`✔ ${result.description}`);
+                        appliedFixes.push({
+                            type:         issue.type,
+                            description:  result.description,
+                            filesChanged: result.filesChanged,
+                        });
                         if (result.filesChanged.length > 0) {
                             info(`changed: ${result.filesChanged.join(", ")}`);
                         }
@@ -354,6 +376,10 @@ export async function runDoctor() {
                 }
                 console.log();
             }
+
+            // Record applied fixes in memory
+            currentMemory = recordFix(currentMemory, appliedFixes);
+            await saveMemory(currentMemory);
 
             if (manual.length > 0) {
                 section("manual fixes required");
@@ -381,6 +407,58 @@ export async function runDoctor() {
                 // strip think blocks from fix summary too
                 const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
                 agentSays(clean);
+                sessionLog.push(`agent: ${clean}`);
+            }
+
+            // ── Fix 3: Verify fixes actually resolved issues ─────────────────────
+            if (appliedFixes.length > 0) {
+                const verifySpinner = spin("verifying fixes...");
+
+                const [scanAfter, diagAfter] = await Promise.all([
+                    scanProject(projectPath).catch(() => null),
+                    runDiagnostics(projectPath).catch(() => []),
+                ]);
+
+                verifySpinner.stop();
+                section("verification");
+
+                if (!scanAfter) {
+                    warn("could not re-scan project — verify manually");
+                } else {
+                    const issuesAfter    = detectIssues(scanAfter, projectPath);
+                    const diagErrorsAfter = getAllErrors(diagAfter);
+
+                    const resolvedCount = issues.length - issuesAfter.length;
+                    const newIssueCount = issuesAfter.filter(
+                        (a) => !issues.some((b) => b.type === a.type)
+                    ).length;
+
+                    if (resolvedCount > 0) {
+                        success(`${resolvedCount} issue${resolvedCount > 1 ? "s" : ""} resolved`);
+                    }
+
+                    if (newIssueCount > 0) {
+                        warn(`${newIssueCount} new issue${newIssueCount > 1 ? "s" : ""} detected after fix`);
+                        for (const i of issuesAfter.filter((a) => !issues.some((b) => b.type === a.type))) {
+                            printIssue(i.severity, i.type);
+                            console.log(`     ${chalk.dim(i.description)}`);
+                        }
+                    }
+
+                    if (diagErrorsAfter.length === 0 && issuesAfter.length === 0) {
+                        success("project is clean");
+                    } else if (diagErrorsAfter.length > 0) {
+                        warn(`${diagErrorsAfter.length} diagnostic error${diagErrorsAfter.length > 1 ? "s" : ""} remain`);
+                        for (const e of diagErrorsAfter.slice(0, 5)) {
+                            const loc = e.file ? `${e.file}:${e.line ?? ""}` : "";
+                            console.log(`     ${chalk.dim(loc)} ${chalk.red(e.code ?? "")} ${e.message}`);
+                        }
+                    }
+
+                    // Update memory with post-fix scan
+                    currentMemory = updateFromScan(currentMemory, scanAfter);
+                    await saveMemory(currentMemory);
+                }
             }
         }
     }
@@ -396,10 +474,16 @@ export async function runDoctor() {
         if (!input) continue;
         if (["exit", "quit", "q", ":q"].includes(input.toLowerCase())) break;
 
-        await agenticTurn(input, projectPath, 0, new Set(), projectLibraries);
+        sessionLog.push(`you: ${input}`);
+        await agenticTurn(input, projectPath, 0, new Set(), projectLibraries, sessionLog);
     }
 
     closePrompt();
+
+    // Summarize and persist this session before exiting
+    const finalMemory = await summarizeSession(currentMemory, sessionLog.join("\n"));
+    await saveMemory(finalMemory);
+
     bye();
     disconnect();
 }
@@ -415,7 +499,8 @@ async function agenticTurn(
     projectPath: string,
     depth = 0,
     alreadyRan: Set<string> = new Set(),
-    projectLibraries: string[] = []
+    projectLibraries: string[] = [],
+    sessionLog: string[] = []
 ): Promise<void> {
     const MAX_DEPTH = 6;
     if (depth > MAX_DEPTH) {
@@ -459,6 +544,7 @@ async function agenticTurn(
         // strip any residual think blocks before display
         const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
         agentSays(clean);
+        if (depth === 0) sessionLog.push(`agent: ${clean}`);
 
         // ── Propose and apply any file patches the agent emitted ────────────────
         const patches = await proposeAndApply(clean, projectPath, { confirmEach: true });
@@ -470,7 +556,8 @@ async function agenticTurn(
                 projectPath,
                 depth + 1,
                 alreadyRan,
-                projectLibraries
+                projectLibraries,
+                sessionLog
             );
             return; // agent will continue the turn above
         }
@@ -490,7 +577,8 @@ async function agenticTurn(
                     projectPath,
                     depth + 1,
                     alreadyRan,
-                    projectLibraries
+                    projectLibraries,
+                    sessionLog
                 );
                 continue;
             }
@@ -502,7 +590,7 @@ async function agenticTurn(
             printCommandResult(result);
 
             // Feed output back to agent — the core of the agentic loop
-            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries);
+            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries, sessionLog);
         }
     }
 }
