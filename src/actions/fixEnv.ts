@@ -1,0 +1,278 @@
+/**
+ * fixEnv.ts — CLI-side atomic fixers
+ *
+ * Each fixer:
+ *   1. Reads the current file (never destroys data if the file is missing)
+ *   2. Applies ONE targeted change
+ *   3. Writes atomically (write to .tmp → rename)
+ *   4. Returns a FixResult with a diff string for display
+ */
+
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { ProjectScan } from "./scanFiles.js";
+
+export interface FixResult {
+  applied: boolean;
+  description: string;
+  diff: string;        // simple +/- diff for display
+  filesChanged: string[];
+}
+
+// ─── Helper: atomic write ─────────────────────────────────────────────────────
+
+async function atomicWrite(filePath: string, content: string): Promise<void> {
+  const tmp = `${filePath}.fixd.tmp`;
+  await fs.writeFile(tmp, content, "utf-8");
+  await fs.rename(tmp, filePath);
+}
+
+// ─── Helper: simple +/- diff ──────────────────────────────────────────────────
+
+function simpleDiff(label: string, added: string[]): string {
+  return [
+    `--- ${label}`,
+    ...added.map((l) => `+ ${l}`),
+  ].join("\n");
+}
+
+// ─── Fixer 1: Prisma directUrl ────────────────────────────────────────────────
+//
+// Adds DIRECT_URL placeholder to .env and adds directUrl to schema.prisma.
+// Only fires when: prisma found + connection is pooled + no directUrl yet.
+
+export async function fixPrismaDirectUrl(
+  projectPath: string,
+  scan: ProjectScan
+): Promise<FixResult> {
+  if (!scan.prisma.found || scan.prisma.hasDirectUrl || scan.prisma.connectionType !== "pooled") {
+    return { applied: false, description: "Prisma directUrl not needed", diff: "", filesChanged: [] };
+  }
+
+  const filesChanged: string[] = [];
+  const diffs: string[] = [];
+
+  // 1. Add DIRECT_URL to .env
+  const envPath = path.join(projectPath, ".env");
+  let envContent = "";
+  try { envContent = await fs.readFile(envPath, "utf-8"); } catch { /* new file */ }
+
+  if (!envContent.includes("DIRECT_URL=")) {
+    const addition = "\n# Direct (non-pooled) URL for Prisma migrations\nDIRECT_URL=postgresql://user:pass@host:5432/dbname?sslmode=require\n";
+    await atomicWrite(envPath, envContent + addition);
+    filesChanged.push(".env");
+    diffs.push(simpleDiff(".env", [
+      "# Direct (non-pooled) URL for Prisma migrations",
+      "DIRECT_URL=postgresql://user:pass@host:5432/dbname?sslmode=require",
+    ]));
+  }
+
+  // 2. Add directUrl to prisma/schema.prisma
+  const schemaPath = path.join(projectPath, "prisma", "schema.prisma");
+  let schemaContent = "";
+  try { schemaContent = await fs.readFile(schemaPath, "utf-8"); } catch { /* no prisma */ }
+
+  if (schemaContent && !schemaContent.includes("directUrl")) {
+    // Insert directUrl line after the url = env(...) line
+    const updated = schemaContent.replace(
+      /(\s+url\s*=\s*env\([^)]+\))/,
+      '$1\n  directUrl = env("DIRECT_URL")'
+    );
+    if (updated !== schemaContent) {
+      await atomicWrite(schemaPath, updated);
+      filesChanged.push("prisma/schema.prisma");
+      diffs.push(simpleDiff("prisma/schema.prisma", ['  directUrl = env("DIRECT_URL")']));
+    }
+  }
+
+  return {
+    applied: filesChanged.length > 0,
+    description: "Added DIRECT_URL to .env and directUrl to prisma/schema.prisma",
+    diff: diffs.join("\n\n"),
+    filesChanged,
+  };
+}
+
+// ─── Fixer 2: tsconfig strict ─────────────────────────────────────────────────
+
+export async function fixTsconfigStrict(
+  projectPath: string,
+  scan: ProjectScan
+): Promise<FixResult> {
+  if (!scan.tsconfig) {
+    return { applied: false, description: "No tsconfig.json found", diff: "", filesChanged: [] };
+  }
+  if (scan.tsconfig.compilerOptions?.strict === true) {
+    return { applied: false, description: "tsconfig strict already enabled", diff: "", filesChanged: [] };
+  }
+
+  const tsconfigPath = path.join(projectPath, "tsconfig.json");
+  const content = await fs.readFile(tsconfigPath, "utf-8");
+  const parsed = JSON.parse(content) as Record<string, any>;
+
+  parsed.compilerOptions = parsed.compilerOptions ?? {};
+  parsed.compilerOptions.strict = true;
+
+  await atomicWrite(tsconfigPath, JSON.stringify(parsed, null, 2) + "\n");
+
+  return {
+    applied: true,
+    description: 'Added "strict": true to tsconfig.json',
+    diff: simpleDiff("tsconfig.json", ['"strict": true']),
+    filesChanged: ["tsconfig.json"],
+  };
+}
+
+// ─── Fixer 3: missing env key ─────────────────────────────────────────────────
+
+export async function addMissingEnvKey(
+  projectPath: string,
+  key: string,
+  placeholder: string,
+  comment?: string
+): Promise<FixResult> {
+  const envPath = path.join(projectPath, ".env");
+  let content = "";
+  try { content = await fs.readFile(envPath, "utf-8"); } catch { /* new */ }
+
+  if (content.includes(`${key}=`)) {
+    return { applied: false, description: `${key} already set`, diff: "", filesChanged: [] };
+  }
+
+  const addition = `\n${comment ? `# ${comment}\n` : ""}${key}=${placeholder}\n`;
+  await atomicWrite(envPath, content + addition);
+
+  return {
+    applied: true,
+    description: `Added ${key} to .env`,
+    diff: simpleDiff(".env", [
+      ...(comment ? [`# ${comment}`] : []),
+      `${key}=${placeholder}`,
+    ]),
+    filesChanged: [".env"],
+  };
+}
+
+// ─── Fixer 4: kill zombie port ────────────────────────────────────────────────
+
+import { killPort } from "./executeCommand.js";
+
+export async function fixPortConflict(port: number): Promise<FixResult> {
+  const result = await killPort(port);
+  return {
+    applied: result.success,
+    description: result.success
+      ? `Killed process on port ${port}`
+      : `Could not kill port ${port}: ${result.stderr}`,
+    diff: "",
+    filesChanged: [],
+  };
+}
+
+// ─── Issue detection (CLI-side, no LLM needed) ───────────────────────────────
+
+export interface DetectedIssue {
+  severity: "HIGH" | "MEDIUM" | "LOW";
+  type: string;
+  description: string;
+  autoFixable: boolean;
+  fix?: () => Promise<FixResult>;
+}
+
+export function detectIssues(scan: ProjectScan, projectPath: string): DetectedIssue[] {
+  const issues: DetectedIssue[] = [];
+
+  // Prisma pooled without directUrl
+  if (scan.prisma.found && scan.prisma.connectionType === "pooled" && !scan.prisma.hasDirectUrl) {
+    issues.push({
+      severity: "HIGH",
+      type: "PRISMA_POOLED_WITHOUT_DIRECT_URL",
+      description:
+        "DATABASE_URL uses a pooled connection but no directUrl is set. " +
+        "Prisma migrations (prisma migrate dev) will fail.",
+      autoFixable: true,
+      fix: () => fixPrismaDirectUrl(projectPath, scan),
+    });
+  }
+
+  // Missing DATABASE_URL when prisma is present
+  if (scan.prisma.found && !scan.env.vars["DATABASE_URL"]) {
+    issues.push({
+      severity: "HIGH",
+      type: "MISSING_DATABASE_URL",
+      description: "Prisma schema found but DATABASE_URL is not set in .env.",
+      autoFixable: true,
+      fix: () =>
+        addMissingEnvKey(
+          projectPath,
+          "DATABASE_URL",
+          "postgresql://user:pass@host:5432/dbname?sslmode=require",
+          "Prisma database connection URL"
+        ),
+    });
+  }
+
+  // Port conflicts on common dev ports
+  const devPorts = [3000, 5173, 8080, 4000];
+  for (const portInfo of scan.runningPorts) {
+    if (devPorts.includes(portInfo.port)) {
+      issues.push({
+        severity: "MEDIUM",
+        type: "PORT_CONFLICT",
+        description: `Port ${portInfo.port} is occupied by PID ${portInfo.pid} (${portInfo.process}).`,
+        autoFixable: true,
+        fix: () => fixPortConflict(portInfo.port),
+      });
+    }
+  }
+
+  // tsconfig missing strict
+  if (scan.tsconfig && scan.tsconfig.compilerOptions?.strict !== true) {
+    issues.push({
+      severity: "LOW",
+      type: "TSCONFIG_STRICT_MISSING",
+      description: 'tsconfig.json does not have "strict": true. This allows unsafe TypeScript patterns.',
+      autoFixable: true,
+      fix: () => fixTsconfigStrict(projectPath, scan),
+    });
+  }
+
+  // No package.json
+  if (!scan.packageJson) {
+    issues.push({
+      severity: "HIGH",
+      type: "MISSING_PACKAGE_JSON",
+      description: "No package.json found in this directory. Is this a Node.js project?",
+      autoFixable: false,
+    });
+  }
+
+  // Missing dev/start scripts
+  if (scan.packageJson) {
+    const scripts = scan.packageJson.scripts ?? {};
+    if (!scripts.dev && !scripts.start) {
+      issues.push({
+        severity: "MEDIUM",
+        type: "MISSING_SCRIPTS",
+        description: 'package.json has no "dev" or "start" script.',
+        autoFixable: false,
+      });
+    }
+  }
+
+  // Node version mismatch
+  if (scan.nodeVersion && scan.requiredNodeVersion) {
+    const running = scan.nodeVersion.replace(/^v/, "").split(".")[0];
+    const required = scan.requiredNodeVersion.replace(/[^0-9.]/g, "").split(".")[0];
+    if (required && running && parseInt(running) < parseInt(required)) {
+      issues.push({
+        severity: "HIGH",
+        type: "NODE_VERSION_MISMATCH",
+        description: `Running Node ${scan.nodeVersion} but package.json requires ${scan.requiredNodeVersion}.`,
+        autoFixable: false,
+      });
+    }
+  }
+
+  return issues;
+}
