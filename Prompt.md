@@ -1,161 +1,259 @@
-Two things to fix:
-1. Agent thinking out loud — that wall of "Okay, let's look at the problem..." is the model's <think> block leaking into output. Strip it in cli/lib/llm.ts before returning:
-typescript// strip <think>...</think> blocks from qwen3 responses
-response = response.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-2. bun add --dev scripts hallucination — model invented a fake command. Needs tighter prompt. In your diagnosis prompt add:
-RULES:
-- Never suggest `bun add` or `npm install` for fixing config issues
-- For package.json script fixes, show ONLY the JSON diff, no commands
-**Prompt:**
-
 ```
-Fix the visual output of `fixd doctor` responses. The agent output is unstructured — 
-thinking text leaks, random prose, inconsistent formatting. 
+Build Context7 integration for fixd CLI. Context7 provides up-to-date library 
+documentation via API — fixes the problem of LLMs generating stale/outdated code.
 
-## Goal
-Every agent response must follow a strict visual structure. The display layer 
-(display.ts) already has all the primitives needed — use them.
+## Context
+fixd is a terminal-native dev environment agent. Stack:
+- `cli/lib/llm.ts` — Groq LLM client
+- `cli/lib/agent.ts` — conversation management, system prompt
+- `cli/lib/display.ts` — terminal UI primitives
+- `cli/doctor.ts` — main doctor flow with agenticTurn()
+- `cli/init.ts` — project scaffolding
 
-## Problem 1: <think> blocks leaking
-In `cli/lib/llm.ts`, strip before returning response:
-```typescript
-response = response.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-```
+CONTEXT7_API_KEY is already in .env.
 
-## Problem 2: Agent prompt not enforcing structure
-The diagnosis prompt sent to LLM must enforce exact output format.
-Replace the current diagPrompt in `cli/doctor.ts` with this structure:
-
-```
-You are fixd. Respond ONLY in this exact format. No prose. No thinking out loud.
-
-ISSUES: {n} found
-
----
-SEVERITY: HIGH | MEDIUM | LOW
-TYPE: {ISSUE_TYPE}
-PROBLEM: One sentence. What exactly is wrong.
-FIX: One sentence. Exact action to take.
-DIFF:
-```diff
-- old line
-+ new line
-```
----
-
-(repeat block per issue)
-
-If no issues: respond with exactly "NO ISSUES FOUND"
-
-RULES:
-- No filler text before or after the blocks
-- No "I recommend", "Let me", "Okay", "First" or any conversational openers
-- No fake commands (never suggest `bun add` for config fixes)
-- For package.json fixes show JSON diff only
-- Max 1 sentence per field
-```
-
-## Problem 3: Parse structured response in display layer
-In `cli/doctor.ts`, after getting agent response, parse the structured blocks
-and render using existing display.ts primitives instead of raw `agentSays()`:
+## What to build: `cli/lib/context7.ts`
 
 ```typescript
-function renderDiagnosisResponse(raw: string) {
-  // strip think blocks
-  const clean = raw.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-  
-  if (clean === "NO ISSUES FOUND") {
-    success("no issues found — project looks clean");
-    return;
-  }
+const BASE_URL = "https://context7.com/api/v1";
 
-  // parse issue blocks separated by ---
-  const blocks = clean.split(/^---$/m).map(b => b.trim()).filter(Boolean);
-  
-  for (const block of blocks) {
-    if (!block.includes("SEVERITY:")) continue;
-    
-    const get = (field: string) =>
-      block.match(new RegExp(`${field}:\\s*(.+)`))?.[1]?.trim() ?? "";
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-    const severity = get("SEVERITY") as "HIGH" | "MEDIUM" | "LOW";
-    const type     = get("TYPE");
-    const problem  = get("PROBLEM");
-    const fix      = get("FIX");
+export interface LibraryDoc {
+  libraryId: string;      // e.g. "/honojs/hono"
+  topic: string;          // e.g. "routing" — what we asked for
+  content: string;        // markdown doc content
+  version: string | null; // library version if returned
+  tokens: number;         // content token count
+}
 
-    // extract diff block
-    const diffMatch = block.match(/```diff\n([\s\S]*?)```/);
-    const diff      = diffMatch?.[1] ?? "";
+export interface Context7Result {
+  docs: LibraryDoc[];
+  totalTokens: number;
+  skipped: string[];      // libraries that failed or returned nothing
+}
 
-    // render using display.ts primitives
-    console.log();
-    printIssue(severity, type);
-    console.log(`     ${chalk.dim("problem:")} ${problem}`);
-    console.log(`     ${chalk.dim("fix:")}     ${fix}`);
-    
-    if (diff) {
-      printFix("suggested change:", diff);
-    }
-  }
-  console.log();
+// ─── Library ID map ───────────────────────────────────────────────────────────
+// Maps common names from fixd init interview → Context7 library IDs
+// If not found in map, use search API to resolve dynamically
+
+const KNOWN_LIBRARIES: Record<string, string> = {
+  // frameworks
+  "hono":          "/honojs/hono",
+  "express":       "/expressjs/express",
+  "fastify":       "/fastify/fastify",
+  "nextjs":        "/vercel/next.js",
+  "next":          "/vercel/next.js",
+  "vite":          "/vitejs/vite",
+
+  // ORMs / DB
+  "prisma":        "/prisma/prisma",
+  "drizzle":       "/drizzle-team/drizzle-orm",
+
+  // auth
+  "better-auth":   "/better-auth/better-auth",
+  "clerk":         "/clerkinc/clerk-docs",
+
+  // runtime
+  "bun":           "/oven-sh/bun",
+
+  // nosana
+  "nosana":        "/nosana-ci/nosana-node",
+};
+```
+
+### Functions to implement
+
+**`resolveLibraryId(name: string): Promise<string | null>`**
+
+Resolve library name to Context7 ID.
+1. Check `KNOWN_LIBRARIES` map first (instant)
+2. If not found, call `GET /api/v1/search?q={name}&limit=3`
+3. Parse response, pick first result with `code_snippet_count > 0`
+4. Return `libraryId` or null if nothing found
+5. Cache resolved IDs in memory (Map) for session duration
+
+**`fetchDocs(libraryId: string, topic: string, maxTokens = 4000): Promise<LibraryDoc | null>`**
+
+Fetch docs for a specific library + topic.
+```
+GET https://context7.com/api/v1{libraryId}?topic={topic}&tokens={maxTokens}
+Headers:
+  X-Context7-Source: fixd
+  Authorization: Bearer {process.env.CONTEXT7_API_KEY}
+```
+- Return null on 404 or empty content
+- Return null on error (never throw — log with `warn()`)
+- Strip excessive whitespace from content before returning
+
+**`fetchDocsForStack(stack: StackChoices): Promise<Context7Result>`**
+
+Called during `fixd init` after interview. Fetches docs for all chosen libraries.
+
+```typescript
+interface StackChoices {
+  framework?: string;   // "hono", "express", etc.
+  orm?: string;         // "prisma", "drizzle"
+  auth?: string;        // "better-auth", "clerk"
+  runtime?: string;     // "bun", "node"
+  database?: string;    // used to pick relevant prisma topics
 }
 ```
 
-Replace `agentSays(msg.text)` in the diagnosis phase with `renderDiagnosisResponse(msg.text)`.
-Keep `agentSays()` for interactive chat phase only.
+Topic selection logic per library:
+- `hono` → topic: "getting started routing middleware"
+- `express` → topic: "routing middleware setup"
+- `prisma` + postgres → topic: "postgresql connection schema migrations"
+- `prisma` + neon → topic: "neon serverless connection pooling directUrl"
+- `drizzle` → topic: "schema migrations postgresql"
+- `better-auth` → topic: "setup nextjs configuration"
+- `bun` → topic: "http server file runtime"
 
-## Problem 4: Chat phase output still needs cleanup
-In the interactive chat loop, before calling `agentSays()`, strip think blocks:
+Fetch all in parallel with `Promise.allSettled`.
+Cap total tokens at 12000 — if over, trim least important libs first (auth < runtime < orm < framework).
+
+**`detectLibrariesInProject(projectPath: string): Promise<string[]>`**
+
+Called during `fixd doctor` chat to auto-detect what docs to fetch.
+Read `package.json` dependencies + devDependencies, map to library IDs using `KNOWN_LIBRARIES`.
+Return list of resolved library IDs found.
+
+**`fetchDocsForQuery(query: string, projectLibraries: string[]): Promise<LibraryDoc[]>`**
+
+Called in `agenticTurn()` when user asks about a library.
+1. Extract library name from query (simple keyword match against KNOWN_LIBRARIES keys)
+2. If match found and in projectLibraries: fetch with query as topic
+3. Cap at 3000 tokens per doc, max 2 docs per query
+4. Return empty array if nothing relevant (never block the response)
+
+**`formatDocsForPrompt(docs: LibraryDoc[]): string`**
+
+Convert docs to injection string for LLM prompt:
+```
+--- CURRENT LIBRARY DOCUMENTATION ---
+The following is up-to-date documentation fetched in real time.
+Prefer this over your training data for these libraries.
+
+[LIBRARY: honojs/hono — routing]
+{content}
+
+[LIBRARY: prisma/prisma — neon connection]
+{content}
+--- END DOCUMENTATION ---
+```
+
+### Integration: `cli/init.ts`
+
+After stack interview, before sending scaffold prompt to LLM:
 
 ```typescript
-const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-agentSays(clean);
+import { fetchDocsForStack, formatDocsForPrompt } from "./lib/context7.js";
+
+// after confirm("scaffold this project?"):
+const docsSpinner = spin("fetching latest docs...");
+const docsResult = await fetchDocsForStack({
+  framework: framework || "hono",
+  orm: orm !== "none" ? orm : undefined,
+  auth: auth !== "none" ? auth : undefined,
+  runtime: pkgManager === "bun" ? "bun" : "node",
+  database: database !== "none" ? database : undefined,
+}).catch(() => ({ docs: [], totalTokens: 0, skipped: [] }));
+docsSpinner.stop();
+
+if (docsResult.docs.length > 0) {
+  info(`fetched docs for: ${docsResult.docs.map(d => d.libraryId.split("/")[2]).join(", ")}`);
+}
+if (docsResult.skipped.length > 0) {
+  info(`skipped (no docs found): ${docsResult.skipped.join(", ")}`);
+}
+
+const docsContext = formatDocsForPrompt(docsResult.docs);
+
+// inject into scaffold prompt:
+const scaffoldPrompt = `
+${docsContext}
+
+Scaffold a new project with these specs:
+- Project name: ${projectName}
+...rest of existing prompt
+`.trim();
 ```
 
-## Problem 5: Chat prompt needs structure rule too
-When sending chat messages in `agenticTurn()`, append to every message:
+### Integration: `cli/doctor.ts` — chat mode
 
+In `agenticTurn()`, detect if user query references a known library and inject docs:
+
+```typescript
+import { detectLibrariesInProject, fetchDocsForQuery, formatDocsForPrompt } from "./lib/context7.js";
+
+// at top of runDoctor(), after scan:
+const projectLibraries = await detectLibrariesInProject(projectPath)
+  .catch(() => [] as string[]);
+
+// in agenticTurn(), before sendMessage():
+async function buildMessageWithDocs(userMessage: string): Promise<string> {
+  const docs = await fetchDocsForQuery(userMessage, projectLibraries)
+    .catch(() => [] as LibraryDoc[]);
+  
+  if (docs.length === 0) return userMessage;
+  
+  const docsContext = formatDocsForPrompt(docs);
+  return `${docsContext}\n\n${userMessage}`;
+}
+
+// replace: sendMessage(withCwd(injectCommandInstruction(userMessage), projectPath))
+// with:
+const enrichedMessage = await buildMessageWithDocs(
+  withCwd(injectCommandInstruction(userMessage), projectPath)
+);
+const responses = await sendMessage(enrichedMessage, "chat").catch(...);
 ```
-\n\nRESPOND FORMAT:
-- Max 4 lines unless showing code
-- If showing code: use fenced blocks with language tag
-- No thinking out loud
-- No "I will", "Let me", "Sure" openers
-- Start answer directly
+
+### Environment
+
+Add to `.env.example`:
+```env
+# Context7
+CONTEXT7_API_KEY=your_key_here
 ```
 
-## Expected output after fix
-
-```
-  issues found
-  ────────────────────────────────────────
-
-  ●  MEDIUM   MISSING_SCRIPTS
-     problem: package.json has no "dev" or "start" script defined
-     fix:     add "start" script pointing to your entry point
-
-     → suggested change:
-     - (no start script)
-     + "start": "tsx cli/index.ts"
-
-
-  ℹ No auto-fixable issues.
-
-  chat mode
-  ────────────────────────────────────────
-
-  ? you › why is strict mode important
-
-  fixd › Strict mode enables additional TypeScript checks:
-         - catches implicit any
-         - enforces null checks  
-         - prevents unsafe operations
-         Recommended for all production TypeScript projects.
+Add to `.env` validation in `cli/index.ts` startup:
+```typescript
+// warn but don't exit — context7 is optional enhancement
+if (!process.env.CONTEXT7_API_KEY) {
+  warn("CONTEXT7_API_KEY not set — library docs unavailable");
+}
 ```
 
 ## Do not touch
-- `cli/lib/display.ts` — only consume it, don't modify
+- `cli/lib/display.ts`
 - `cli/lib/diagnostics.ts`
 - `cli/lib/executor.ts`
+- `cli/lib/patcher.ts`
 - `src/actions/`
+
+## Verification
+
+```
+fixd init
+
+  ? backend framework (hono / express / fastify) › hono
+  ? orm (prisma / drizzle / none) › prisma
+  ? postgres hosting (neon / supabase / railway / local) › neon
+  ...
+
+  ⠋ fetching latest docs...
+  ℹ fetched docs for: hono, prisma
+  ℹ skipped (no docs found): (none)
+
+  ⠋ generating project...
+  [streams files with current hono v4 syntax + correct neon+prisma config]
+```
+
+And in doctor chat:
+```
+  ? you › how do i add middleware in hono
+
+  [auto-fetches hono middleware docs, injects, responds with current v4 syntax]
+```
 ```

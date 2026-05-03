@@ -9,6 +9,38 @@ import { chat, ask, type Message, type Task } from "./llm.js";
 
 // ─── System prompt — built from characters/agent.character.json ───────────────
 
+const PATCH_INSTRUCTIONS = `
+
+WHEN IMPLEMENTING CODE CHANGES:
+Use these exact markers — no other format will be parsed:
+
+To create or fully rewrite a file:
+<<<WRITE: relative/path/to/file.ts>>>
+full file content
+<<<END>>>
+
+To make a targeted edit (preferred for small changes):
+<<<EDIT: relative/path/to/file.ts>>>
+<<<SEARCH>>>
+exact existing lines to find (copy verbatim, including indentation)
+<<<REPLACE>>>
+new lines to replace them with
+<<<END>>>
+
+To delete a file:
+<<<DELETE: relative/path/to/file.ts>>>
+
+To rename a file:
+<<<RENAME: old/path.ts -> new/path.ts>>>
+
+RULES:
+- Always use EDIT over WRITE when changing less than 30% of a file
+- SEARCH string must match exactly — copy lines verbatim including whitespace
+- Paths are always relative to the project root
+- After markers, explain what you changed and why in 1-2 sentences
+- Never output partial file content in WRITE blocks — always full file
+`;
+
 function loadSystemPrompt(): string {
     try {
         // Resolve relative to this file's location: cli/lib/ → ../../characters/
@@ -35,10 +67,13 @@ function loadSystemPrompt(): string {
             parts.push("\nSTYLE RULES:\n" + styleRules.map((r: string) => `- ${r}`).join("\n"));
         }
 
+        // Append patch marker instructions
+        parts.push(PATCH_INSTRUCTIONS);
+
         return parts.join("\n");
     } catch {
         // Fallback if character file not found
-        return "You are fixd, a terminal-native dev environment agent. Be terse and technical.";
+        return "You are fixd, a terminal-native dev environment agent. Be terse and technical." + PATCH_INSTRUCTIONS;
     }
 }
 

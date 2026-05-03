@@ -1,9 +1,11 @@
 import chalk from "chalk";
-import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { execa } from "execa";
 import { askStream } from "./lib/llm.js";
 import { disconnect } from "./lib/agent.js";
+import { proposeAndApply } from "./lib/patcher.js";
+import { fetchDocsForStack, formatDocsForPrompt } from "./lib/context7.js";
+
 import {
     printHeader,
     agentSays,
@@ -29,39 +31,6 @@ const PKG_MANAGERS = ["bun", "pnpm", "npm"];
 
 function choose(label: string, options: string[]): string {
     return `${label} (${options.join(" / ")})`;
-}
-
-// ─── Parse streamed response for file blocks ──────────────────────────────────
-// Detects ``` filename.ext ... ``` blocks and writes them to disk.
-
-interface ParsedFile {
-    filename: string;
-    content: string;
-}
-
-function parseFileBlocks(response: string): ParsedFile[] {
-    const files: ParsedFile[] = [];
-    // Match ```filename.ext\n...content...\n``` — filename must have an extension
-    const blockRe = /```([\w./\-]+\.\w+)\n([\s\S]*?)```/g;
-    let match: RegExpExecArray | null;
-    while ((match = blockRe.exec(response)) !== null) {
-        files.push({ filename: match[1], content: match[2] });
-    }
-    return files;
-}
-
-function writeScaffoldFiles(projectName: string, files: ParsedFile[]): string[] {
-    const written: string[] = [];
-    const base = path.join(process.cwd(), projectName);
-
-    for (const f of files) {
-        const dest = path.join(base, f.filename);
-        mkdirSync(path.dirname(dest), { recursive: true });
-        writeFileSync(dest, f.content, "utf-8");
-        written.push(f.filename);
-    }
-
-    return written;
 }
 
 export async function runInit() {
@@ -109,11 +78,31 @@ export async function runInit() {
         return;
     }
 
-    // ── Stream scaffold from LLM ───────────────────────────────────────────────
+    // ── Fetch live docs from Context7 before generating ──────────────────────
+    const docsSpinner = spin("fetching latest docs...");
+    const docsResult = await fetchDocsForStack({
+        framework: framework || "hono",
+        orm: orm !== "none" ? orm : undefined,
+        auth: auth !== "none" ? auth : undefined,
+        runtime: pkgManager === "bun" ? "bun" : "node",
+        database: database !== "none" ? database : undefined,
+    }).catch(() => ({ docs: [], totalTokens: 0, skipped: [] as string[] }));
+    docsSpinner.stop();
+
+    if (docsResult.docs.length > 0) {
+        info(`fetched docs for: ${docsResult.docs.map((d) => d.libraryId.split("/").at(-1)).join(", ")}`);
+    }
+    if (docsResult.skipped.length > 0) {
+        info(`skipped (no docs found): ${docsResult.skipped.join(", ")}`);
+    }
+
+    const docsContext = formatDocsForPrompt(docsResult.docs);
+
+    // ── Stream scaffold from LLM ────────────────────────────────────────────
     section("scaffolding");
 
     const scaffoldPrompt = `
-Scaffold a complete, production-ready project with these specs:
+${docsContext ? docsContext + "\n\n" : ""}Scaffold a complete, production-ready project with these specs:
 - Project name: ${projectName}
 - Backend framework: ${framework || "hono"}
 - Database: ${database || "postgres"}
@@ -122,12 +111,11 @@ ${dbHost ? `- Database hosting: ${dbHost}` : ""}
 - Auth: ${auth || "none"}
 - Frontend: ${frontend || "none"}
 - Package manager: ${pkgManager || "bun"}
-- Output directory: ${process.cwd()}/${projectName}
 
-Generate ALL config files. For EACH file, output it in this exact format:
-\`\`\`filename.ext
+Generate ALL config files. Use this EXACT format for each file:
+<<<WRITE: filename.ext>>>
 <file content here>
-\`\`\`
+<<<END>>>
 
 Required files: tsconfig.json, .env.example, .gitignore, package.json (with correct scripts), README.md.
 If ORM is prisma: include prisma/schema.prisma with correct connection string format.
@@ -135,6 +123,7 @@ If auth is not none: include the auth config file.
 Use correct connection string format for the chosen database hosting.
 Do not add explanations between files — just output the file blocks.
   `.trim();
+
 
     console.log();
     info("streaming scaffold — files will be written after completion...");
@@ -154,22 +143,22 @@ Do not add explanations between files — just output the file blocks.
         return;
     }
 
-    // ── Write files to disk ────────────────────────────────────────────────────
-    const files = parseFileBlocks(fullResponse);
+    // ── Write files via patcher (autoApprove — user already confirmed above) ──────
+    const projectDir = path.join(process.cwd(), projectName);
+    const results = await proposeAndApply(fullResponse, projectDir, { autoApprove: true });
+    const written = results.filter((r) => r.applied).map((r) => r.path);
 
-    if (files.length === 0) {
+    if (written.length === 0) {
         warn("No file blocks found in response. Check the output above and create files manually.");
     } else {
         section("writing files");
-        const written = writeScaffoldFiles(projectName, files);
         for (const f of written) {
-            success(`wrote: ${projectName}/${f}`);
+            success(`wrote: ${f}`);
         }
         console.log();
 
         // ── Git init ───────────────────────────────────────────────────────────
         const gitSpinner = spin("initialising git...");
-        const projectDir = path.join(process.cwd(), projectName);
         try {
             await execa("git", ["init"], { cwd: projectDir });
             await execa("git", ["add", "."], { cwd: projectDir });
@@ -181,6 +170,7 @@ Do not add explanations between files — just output the file blocks.
             warn(`git init failed: ${err.message}`);
         }
     }
+
 
     console.log();
     closePrompt();

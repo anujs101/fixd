@@ -1,6 +1,13 @@
 import chalk from "chalk";
 import path from "node:path";
 import { sendMessage, disconnect } from "./lib/agent.js";
+import { proposeAndApply } from "./lib/patcher.js";
+import {
+    detectLibrariesInProject,
+    fetchDocsForQuery,
+    formatDocsForPrompt,
+    type LibraryDoc,
+} from "./lib/context7.js";
 
 import { scanProject } from "../src/actions/scanFiles.js";
 import { detectIssues, type DetectedIssue } from "../src/actions/fixEnv.js";
@@ -216,6 +223,9 @@ export async function runDoctor() {
     }
     scanSpinner.stop();
 
+    // ── Detect project libraries for Context7 doc injection ──────────────────
+    const projectLibraries = await detectLibrariesInProject(projectPath).catch(() => [] as string[]);
+
     // Run stack-aware diagnostics in parallel (tsc, eslint, mypy, cargo, go vet...)
     const diagSpinner2 = spin("running diagnostics...");
     const diagResults = await runDiagnostics(projectPath);
@@ -386,7 +396,7 @@ export async function runDoctor() {
         if (!input) continue;
         if (["exit", "quit", "q", ":q"].includes(input.toLowerCase())) break;
 
-        await agenticTurn(input, projectPath, 0, new Set());
+        await agenticTurn(input, projectPath, 0, new Set(), projectLibraries);
     }
 
     closePrompt();
@@ -404,7 +414,8 @@ async function agenticTurn(
     userMessage: string,
     projectPath: string,
     depth = 0,
-    alreadyRan: Set<string> = new Set()
+    alreadyRan: Set<string> = new Set(),
+    projectLibraries: string[] = []
 ): Promise<void> {
     const MAX_DEPTH = 6;
     if (depth > MAX_DEPTH) {
@@ -426,7 +437,17 @@ async function agenticTurn(
         "- Start answer directly",
     ].join("\n");
 
-    const responses = await sendMessage(withCwd(userMessage + CHAT_FORMAT, projectPath), "chat").catch((err: any) => {
+    // Enrich with live docs if user is asking about a known library (depth 0 only)
+    let enrichedMessage = withCwd(userMessage + CHAT_FORMAT, projectPath);
+    if (depth === 0) {
+        const docs: LibraryDoc[] = await fetchDocsForQuery(userMessage, projectLibraries).catch(() => []);
+        if (docs.length > 0) {
+            const docsContext = formatDocsForPrompt(docs);
+            enrichedMessage = `${docsContext}\n\n${enrichedMessage}`;
+        }
+    }
+
+    const responses = await sendMessage(enrichedMessage, "chat").catch((err: any) => {
         thinkSpinner.stop();
         warn(err.message);
         return [];
@@ -439,7 +460,22 @@ async function agenticTurn(
         const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
         agentSays(clean);
 
-        // ── Detect commands the agent wants to run ──────────────────────────────────
+        // ── Propose and apply any file patches the agent emitted ────────────────
+        const patches = await proposeAndApply(clean, projectPath, { confirmEach: true });
+        const applied = patches.filter((p) => p.applied);
+        if (applied.length > 0) {
+            // Feed applied changes back so the agent has accurate context
+            await agenticTurn(
+                `Applied ${applied.length} file change(s):\n${applied.map((p) => `- ${p.op} ${p.path}`).join("\n")}\n\nContinue.`,
+                projectPath,
+                depth + 1,
+                alreadyRan,
+                projectLibraries
+            );
+            return; // agent will continue the turn above
+        }
+
+        // ── Detect shell commands the agent wants to run ────────────────────────
         const pending = extractPendingCommands(msg.text, alreadyRan);
 
         for (const cmd of pending) {
@@ -453,7 +489,8 @@ async function agenticTurn(
                     `[User declined to run: \`${cmd.command}\`]. Suggest an alternative or explain what to do manually.`,
                     projectPath,
                     depth + 1,
-                    alreadyRan
+                    alreadyRan,
+                    projectLibraries
                 );
                 continue;
             }
@@ -465,7 +502,7 @@ async function agenticTurn(
             printCommandResult(result);
 
             // Feed output back to agent — the core of the agentic loop
-            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan);
+            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries);
         }
     }
 }

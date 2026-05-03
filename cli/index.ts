@@ -92,6 +92,12 @@ async function preflight(): Promise<boolean> {
         return false;
     }
 
+    // Context7 is optional — warn but never block startup
+    if (!process.env.CONTEXT7_API_KEY) {
+        const { warn: displayWarn } = await import("./lib/display.js");
+        displayWarn("CONTEXT7_API_KEY not set — live library docs unavailable");
+    }
+
     const healthy = await checkHealth();
     if (!healthy) {
         console.log();
