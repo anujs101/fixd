@@ -1,486 +1,441 @@
-# Nosana x ElizaOS Agent Challenge
+<div align="center">
 
-![ElizaOS](./assets/NosanaXEliza.jpg)
+#  fixd
 
-Build your own **personal AI agent** using [ElizaOS](https://elizaos.com) and deploy it on the [Nosana](https://nosana.com) decentralized compute network. Win a share of **$3,000 USDC** in prizes.
+### Your AI-powered dev environment agent — diagnose, scaffold, and ship faster.
 
----
+[![Version](https://img.shields.io/badge/version-0.1.0-6366f1?style=flat-square)](https://github.com/anujs101/fixd)
+[![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
+[![Powered by Groq](https://img.shields.io/badge/LLM-Groq-f97316?style=flat-square)](https://console.groq.com)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3b82f6?style=flat-square)](https://typescriptlang.org)
+[![Bun Ready](https://img.shields.io/badge/runtime-Bun%20%2F%20Node-a855f7?style=flat-square)](https://bun.sh)
 
-## The Challenge
-
-Inspired by [OpenClaw](https://openclaw.ai/) — the self-hosted personal AI movement — this challenge is about giving AI back to the individual. Build an agent that runs on **your own infrastructure**, handles **your own tasks**, and keeps **your own data**.
-
-> **Theme: Personal AI Agents** — Build an AI agent that acts as a personal assistant, automate your life, or solve a real problem for yourself or your community. The use case is entirely up to you.
-
-**Framework:** [ElizaOS](https://elizaos.com) (latest v2)
-**Compute:** [Nosana](https://nosana.com) decentralized GPU network
-**Model:** Qwen3.5-27B (hosted endpoint provided by Nosana)
+</div>
 
 ---
 
-## Prizes — $3,000 USDC Total
+##  Demo
 
-| Place | Prize |
-|-------|-------|
-| 🥇 1st | $1,000 USDC |
-| 🥈 2nd | $750 USDC |
-| 🥉 3rd | $450 USDC |
-| 4th | $200 USDC |
-| 5th–10th | $100 USDC each |
+<div align="center">
+  <img src="./ss.jpg" alt="fixd in action" width="100%" />
+</div>
 
----
+```
+$ fixd doctor
 
-## Schedule
+  ✖ [TYPESCRIPT] src/index.ts:12:5  TS2345  Argument of type 'string' is not assignable...
+  ✖ [TYPESCRIPT] src/lib/auth.ts:44:3  TS2304  Cannot find name 'db'...
 
-Follow Nosana's Luma for more information: [Nosana Luma](https://luma.com/calendar/cal-RF19mq3EtF4juLc)
+  ─── issues found ──────────────────────────────────────────────────────
+  ● [HIGH]  MISSING_ENV_VAR
+     problem: DATABASE_URL is not set in .env
+     fix:     Add DATABASE_URL to .env and restart the dev server
 
-![](./assets/image.png)
+  ✔ apply 1 auto-fix? › yes
 
----
+  ─── verification ──────────────────────────────────────────────────────
+  ✔ 1 issue resolved
+  ✔ project is clean
 
-## What to Build
-
-There are no strict requirements on use case — build whatever is most useful to you. Some ideas to get started:
-
-- 🗂️ **Personal assistant** — calendar, tasks, email drafting, reminders
-- 🔍 **Research agent** — web search, summarization, knowledge synthesis
-- 📱 **Social media manager** — Twitter/X, Telegram, Discord automation
-- 💰 **DeFi/crypto agent** — portfolio monitoring, on-chain alerts, trading insights
-- 🏠 **Home automation** — smart home control, IoT integration
-- 🛠️ **DevOps helper** — monitor services, automate deployments
-- 🎨 **Content creator** — blog posts, social copy, creative writing
-
-**Tip:** ElizaOS has a rich [plugin ecosystem](https://elizaos.github.io/eliza/docs/core/plugins). Explore existing plugins and templates before building from scratch — you might find 80% of what you need already exists.
+  ─── chat mode ─────────────────────────────────────────────────────────
+  › you:
+```
 
 ---
 
-## Getting Started
+##  Problem Statement
+
+Every developer has wasted hours on the same class of problems: a missing env var that crashes the server at 2am, a `tsconfig` that's silently misconfigured, a scaffold that's already outdated before the first commit, or a deployment that requires knowing five different CLI tools.
+
+These aren't hard problems. They're just **tedious, repetitive, and context-dependent** — which makes them perfect for an AI agent.
+
+**fixd** brings a language-model-powered agent directly into your terminal to handle exactly this. No dashboard. No SaaS. No agent server to babysit. Just run `fixd` in your project and get a senior dev looking over your shoulder.
+
+---
+
+##  Solution Overview
+
+`fixd` is a zero-infrastructure CLI agent that:
+
+1. **Scans your project** deterministically — reads `package.json`, `tsconfig.json`, `.env`, Prisma schema, running ports, and more.
+2. **Runs stack-aware diagnostics** — executes `tsc`, `eslint`, `cargo check`, `go vet`, `mypy`, and other linters in parallel without any configuration from you.
+3. **Sends rich context to an LLM** (via Groq) to reason about root causes and suggest diffs.
+4. **Auto-applies safe fixes** with your approval, then **re-scans to verify** the fixes actually worked.
+5. **Drops into an agentic chat loop** where it can propose and run shell commands or write files — all gated by your explicit approval.
+6. **Remembers everything** across sessions via a local `.fixd/memory.json`, so it knows what was broken before and what was already fixed.
+
+---
+
+##  Features
+
+###  `fixd doctor` — Intelligent Diagnostics
+- **Multi-stack static analysis** — auto-detects TypeScript, Python, Rust, Go, Ruby, PHP, Java, and Kotlin projects; runs the right tool for each.
+- **Structured issue reporting** — severity-tagged (`HIGH / MEDIUM / LOW`), auto-fixable vs. manual triage, with suggested diffs.
+- **Post-fix verification** — re-scans after applying patches to confirm issues are actually resolved, not just suppressed.
+- **Agentic chat** — interactive REPL where the agent can propose and run commands (with your approval) in a self-correcting loop.
+
+### `fixd init` — AI Scaffolding with Live Docs
+- **Guided stack selection** — choose your framework (Hono / Express / Fastify), database (PostgreSQL / MySQL / SQLite / MongoDB), ORM (Prisma / Drizzle), auth (better-auth / Clerk), and frontend (Next.js / Vite-React).
+- **Context7 doc injection** — fetches real-time, version-accurate library documentation before generation, eliminating stale API hallucinations.
+- **Full project output** — generates `package.json`, `tsconfig.json`, `.env`, `.gitignore`, `README.md`, entry points, Prisma schema, and auth config in one shot.
+- **Auto-wired setup** — runs `git init` + initial commit + dependency install automatically after writing files.
+
+###  `fixd deploy` — Containerize & Ship
+- **AI-generated Dockerfile** — analyses your `package.json` and `tsconfig` to produce a production-ready multi-stage build.
+
+###  Persistent Memory
+- Stores project history in `.fixd/memory.json` — last scan timestamp, known stack, previously fixed issues, and per-session chat summaries.
+- Injected into every LLM prompt so the agent has full context without you having to re-explain your project.
+- Capped at 50 fix records and 10 session summaries to stay prompt-efficient.
+
+###  Resilient LLM Layer
+- **Smart model routing** — lightweight tasks (`classify`, `explain`) use `llama-4-scout`; heavy tasks (`generate`, `diagnose`) use `qwen3-32b`.
+- **Automatic fallback** — if the large model is rate-limited or unavailable, transparently retries with the small model.
+- **Retry logic** — handles `429 Rate Limited` and `5xx` errors with exponential back-off, up to 3 attempts.
+
+---
+
+##  Tech Stack
+
+| Layer | Technology |
+|---|---|
+| **Runtime** | Node.js 23 / Bun |
+| **Language** | TypeScript 6 (ESM) |
+| **LLM Backend** | [Groq API](https://console.groq.com) (OpenAI-compatible) |
+| **Small Model** | `meta-llama/llama-4-scout-17b-16e-instruct` |
+| **Large Model** | `qwen/qwen3-32b` |
+| **Live Docs** | [Context7](https://context7.com) API |
+| **CLI UX** | `chalk`, `ora`, `inquirer`, `readline-sync` |
+| **Process Execution** | `execa` |
+| **File Watching** | `chokidar` |
+| **Containerization** | Docker (Node 23-slim base) |
+| **Diagnostics** | `tsc`, `eslint`, `mypy`, `flake8`, `cargo check`, `go vet`, `rubocop`, `phpstan` |
+
+---
+
+##  Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                     fixd CLI                        │
+│                  cli/index.ts                       │
+│   (entry point · preflight · command routing)       │
+└────────────┬───────────────────────┬────────────────┘
+             │                       │
+    ┌────────▼──────┐       ┌────────▼──────┐
+    │  fixd doctor  │       │   fixd init   │
+    │  cli/doctor.ts│       │  cli/init.ts  │
+    └────────┬──────┘       └────────┬──────┘
+             │                       │
+    ┌────────▼──────────────────────▼────────────────┐
+    │                  cli/lib/                       │
+    │                                                 │
+    │  llm.ts        ← Groq API client                │
+    │  agent.ts      ← multi-turn conversation state  │
+    │  diagnostics.ts← stack detection + linting      │
+    │  memory.ts     ← .fixd/memory.json persistence  │
+    │  context7.ts   ← live library doc fetcher       │
+    │  patcher.ts    ← file diff proposal + apply     │
+    │  executor.ts   ← shell command extraction + run │
+    │  display.ts    ← terminal UI primitives         │
+    └─────────────────────────┬──────────────────────┘
+                              │
+    ┌─────────────────────────▼──────────────────────┐
+    │               src/actions/                      │
+    │  scanFiles.ts  ← project scanner (env, pkg, ts) │
+    │  fixEnv.ts     ← deterministic issue detector   │
+    └────────────────────────────────────────────────┘
+```
+
+### Key Data Flows
+
+**`fixd doctor` flow:**
+```
+cwd → scanProject() → runDiagnostics() → detectIssues()
+    → [LLM] structured diagnosis prompt
+    → renderDiagnosisResponse() → user approval
+    → apply fixes → re-scan → verify
+    → agenticTurn() chat loop (infinite, with context7 enrichment)
+```
+
+**`fixd init` flow:**
+```
+user prompts → fetchDocsForStack() [Context7 API]
+            → scaffold prompt + live docs → askStream() [Groq]
+            → proposeAndApply() → git init → install deps
+```
+
+---
+
+##  Getting Started
 
 ### Prerequisites
 
-- Node.js 23+
-- pnpm (`npm install -g pnpm`)
-- Docker (for deployment)
-- Git
+- **Node.js** ≥ 18 or **Bun** ≥ 1.0
+- A **Groq API key** — free tier at [console.groq.com/keys](https://console.groq.com/keys)
+- _(Optional)_ A **Context7 API key** for live library docs — [context7.com](https://context7.com)
 
-### Quick Start
+### Installation
 
 ```bash
-# Fork this repo, then clone your fork
-git clone https://github.com/YOUR-USERNAME/agent-challenge
-cd agent-challenge
-
-# Copy and configure environment variables
-cp .env.example .env
-# Edit .env with your Nosana endpoint details
+# Clone the repository
+git clone https://github.com/anujs101/fixd.git
+cd fixd
 
 # Install dependencies
-bun i -g @elizaos/cli
-
-# Start your agent in development mode
-elizaos dev
+npm install
+# or
+bun install
 ```
 
-Open [http://localhost:3000](http://localhost:3000) to see the ElizaOS built-in client.
+### Environment Setup
 
----
+```bash
+cp .env.example .env
+```
 
-## Claim Your Nosana Builders Credits
-
-All challenge participants get **free compute credits** to deploy and run their agents on Nosana.
-
-**How to claim:**
-
-1. Visit [nosana.com/builders-credits](https://nosana.com/builders-credits)
-2. Sign up or log in with your wallet
-3. Your credits will be added to your account automatically
-4. Use these credits to deploy your ElizaOS agent to the Nosana network
-
-These credits cover the compute costs for running your agent during the challenge period.
-
-> **Note:** Credits are airdropped twice a day. Please be patient if you don't see them immediately after signing up.
-
----
-
-## Configure Your LLM
-
-Nosana provides a hosted **Qwen3.5-27B-AWQ-4bit** endpoint for challenge participants. Update your `.env`:
+Open `.env` and fill in your keys:
 
 ```env
-OPENAI_API_KEY=nosana
-OPENAI_API_URL=https://6vq2bcqphcansrs9b88ztxfs88oqy7etah2ugudytv2x.node.k8s.prd.nos.ci/v1
-MODEL_NAME=Qwen3.5-27B-AWQ-4bit
+# Required
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx
+
+# Optional — enables live library documentation in init + chat
+CONTEXT7_API_KEY=your_context7_key
+
+# Optional model overrides
+# SMALL_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+# LARGE_MODEL=qwen/qwen3-32b
 ```
 
-**Model Details:**
-- **Model ID:** `Qwen3.5-27B-AWQ-4bit`
-- **Max Context Length:** 60,000 tokens
-- **Provider:** Nosana decentralized inference
-- **Base Model:** cyankiwi/Qwen3.5-27B-AWQ-4bit
-
-### Option B: Local Development with Ollama
+### Running Locally
 
 ```bash
-ollama pull qwen3.5:27b # or a smaller one for your system
-ollama serve
+# Verify API connectivity
+npm run fixd status
+
+# Run from any project directory
+npm run fixd doctor
+npm run fixd init
+npm run fixd deploy
 ```
 
-```env
-OPENAI_API_KEY=ollama
-OPENAI_API_URL=http://127.0.0.1:11434/v1
-MODEL_NAME=qwen3.5:27b
-```
-
----
-
-## Configure Your Embedding Model
-
-Nosana provides a hosted **Qwen3-Embedding-0.6B** endpoint for embeddings (used for RAG, semantic search, and memory). Update your `.env`:
-
-```env
-OPENAI_EMBEDDING_URL=https://4yiccatpyxx773jtewo5ccwhw1s2hezq5pehndb6fcfq.node.k8s.prd.nos.ci/v1
-OPENAI_EMBEDDING_API_KEY=nosana
-OPENAI_EMBEDDING_MODEL=Qwen3-Embedding-0.6B
-OPENAI_EMBEDDING_DIMENSIONS=1024
-```
-
-**Model Details:**
-- **Model ID:** `Qwen3-Embedding-0.6B`
-- **Dimensions:** 1024
-- **Provider:** Nosana decentralized inference
-
----
-
-## Customize Your Agent
-
-### 1. Define your agent's character
-
-Edit `characters/agent.character.json` to define your agent's personality, knowledge, and behavior:
-
-```json
-{
-  "name": "MyAgent",
-  "bio": ["Your agent's backstory and capabilities"],
-  "system": "Your agent's core instructions and behavior",
-  "plugins": ["@elizaos/plugin-bootstrap", "@elizaos/plugin-openai"],
-  "clients": ["direct"]
-}
-```
-
-### 2. Add plugins
-
-Extend your agent by adding plugins to `package.json` and your character file:
-
-| Plugin | Use Case |
-|--------|----------|
-| `@elizaos/plugin-bootstrap` | Required base plugin |
-| `@elizaos/plugin-openai` | OpenAI-compatible LLM (required for Nosana endpoint) |
-| `@elizaos/plugin-web-search` | Web search capability |
-| `@elizaos/plugin-telegram` | Telegram bot client |
-| `@elizaos/plugin-discord` | Discord bot client |
-| `@elizaos/plugin-twitter` | Twitter/X integration |
-| `@elizaos/plugin-browser` | Browser/web automation |
-| `@elizaos/plugin-sql` | Database access |
-
-Install a plugin:
-```bash
-pnpm add @elizaos/plugin-web-search
-```
-
-Add it to your character file:
-```json
-{
-  "plugins": ["@elizaos/plugin-bootstrap", "@elizaos/plugin-openai", "@elizaos/plugin-web-search"]
-}
-```
-
-### 3. Build custom actions (optional)
-
-Add your own custom logic in `src/index.ts`. See the example plugin already included.
-
-### 4. Persistent storage
-
-SQLite is configured by default — sufficient for development and small-scale agents. For a production-grade personal agent, consider:
-
-- A mounted volume on Nosana
-- External database (PostgreSQL, PlanetScale, etc.)
-- Decentralized storage (Arweave, IPFS)
-
----
-
-## Deploy to Nosana
-
-> **Important:** For this challenge, you must deploy your agent to Nosana's decentralized infrastructure. Do **not** use the standard `elizaos deploy` command — that deploys to centralized cloud providers. This challenge is about embracing decentralized compute.
-
-**Why Nosana?**
-- **Decentralized** — Your agent runs on a distributed network of GPU providers, not AWS/GCP/Azure
-- **Cost-effective** — Use your free builders credits (no credit card required)
-- **Permissionless** — No vendor lock-in, full control over your infrastructure
-- **Challenge requirement** — All submissions must be deployed on Nosana
-
-### Prerequisites
-
-Before deploying, ensure you have:
-- [Docker](https://docs.docker.com/get-docker/) installed and running
-- A [Docker Hub](https://hub.docker.com/) account (free)
-- Your [Nosana builders credits](https://nosana.com/builders-credits) claimed
-
-### Step 1: Build and Push Your Docker Image
-
-Your agent needs to be containerized and available on a public registry (Docker Hub) so Nosana nodes can pull and run it.
+Or, if you want to use it globally across your machine:
 
 ```bash
-# Build your Docker image
-docker build -t yourusername/nosana-eliza-agent:latest .
-
-# Test it locally first (recommended)
-docker run -p 3000:3000 --env-file .env yourusername/nosana-eliza-agent:latest
-
-# Visit http://localhost:3000 to verify it works
-
-# Log in to Docker Hub
-docker login
-
-# Push to Docker Hub (make it public)
-docker push yourusername/nosana-eliza-agent:latest
+npm link        # or: bun link
+fixd status     # now available system-wide
 ```
 
-> **Tip:** Replace `yourusername` with your actual Docker Hub username. Make sure your repository is **public** so Nosana nodes can pull it.
+---
 
-### Step 2: Configure Your Job Definition
+##  Usage
 
-Edit `nos_job_def/nosana_eliza_job_definition.json` and update the Docker image reference:
-
-```json
-{
-  "version": "0.1",
-  "type": "container",
-  "meta": {
-    "trigger": "cli"
-  },
-  "ops": [
-    {
-      "type": "container/run",
-      "id": "eliza-agent",
-      "args": {
-        "image": "yourusername/nosana-eliza-agent:latest",  // <- Change this
-        "ports": ["3000:3000"],
-        "env": {
-          "OPENAI_API_KEY": "nosana",
-          "OPENAI_API_URL": "https://6vq2bcqphcansrs9b88ztxfs88oqy7etah2ugudytv2x.node.k8s.prd.nos.ci/v1",
-          "MODEL_NAME": "Qwen3.5-27B-AWQ-4bit"
-        }
-      }
-    }
-  ]
-}
-```
-
-> **Security Note:** For production deployments, avoid hardcoding sensitive environment variables. Consider using Nosana secrets management or external secret stores.
-
-### Step 3: Deploy via Nosana Dashboard (Easiest)
-
-This is the recommended method for beginners:
-
-1. Visit the [Nosana Dashboard](https://dashboard.nosana.com/deploy)
-2. Connect your Solana wallet (you need this for authentication and using credits)
-3. Click **Expand** to open the job definition editor
-4. Copy and paste the contents of your `nos_job_def/nosana_eliza_job_definition.json` file
-5. Select your preferred compute market:
-   - `nvidia-3090` — High performance (recommended for production)
-   - `nvidia-rtx-4090` — Premium performance
-   - `cpu-only` — Budget option (slower inference)
-6. Click **Deploy**
-7. Wait for a node to pick up your job (usually 30-60 seconds)
-8. Once running, you'll receive a public URL to access your agent
-
-### Step 4: Deploy via Nosana CLI (Advanced)
-
-For developers who prefer the command line or want to automate deployments:
-
-1. First get your API key at [https://deploy.nosana.com/account/](https://deploy.nosana.com/account/)
-2. Edit the [Nosana ElizaOS Job Definition File](./nos_job_def/nosana_eliza_job_definition.json)
-3. Learn more about [Nosana Job Definition Here](https://learn.nosana.com/deployments/jobs/job-definition/intro.html)
+### Diagnose a broken project
 
 ```bash
-# Install the Nosana CLI globally
-npm install -g @nosana/cli
-
-# Deploy your agent
-nosana job post \
-  --file ./nos_job_def/nosana_eliza_job_definition.json \
-  --market nvidia-4090 \
-  --timeout 300 \
-  --api <API_KEY>
-
-# Monitor your deployment
-nosana job status <job-id>
-
-# View logs
-nosana job logs <job-id>
+cd /path/to/your/project
+fixd doctor
 ```
 
-**CLI Flags Explained:**
-- `--file` — Path to your job definition JSON
-- `--market` — Which GPU market to use (nvidia-3090, nvidia-rtx-4090, etc.)
-- `--timeout` — Maximum job runtime in minutes
+fixd will:
+1. Scan all config files and detect your stack
+2. Run the relevant type checkers and linters in parallel
+3. Show a structured issue report — severity, root cause, suggested fix
+4. Ask if you want to apply auto-fixable issues
+5. Verify the fixes, then drop into an interactive chat
 
-### Step 5: Verify Your Deployment
-
-Once your job is running on Nosana:
-
-1. **Test the endpoint** — Visit the public URL provided by Nosana
-2. **Check agent responsiveness** — Send a test message to your agent
-3. **Monitor logs** — Use the Nosana Dashboard or CLI to view logs
-4. **Verify inference** — Ensure the Qwen3.5-27B model is responding correctly
-
-### Troubleshooting
-
-**Agent not starting?**
-- Check that your Docker image is public on Docker Hub
-- Verify your job definition JSON is valid
-- Ensure environment variables are correctly set
-- Check Nosana dashboard logs for error messages
-
-**Slow response times?**
-- Consider using a higher-tier GPU market (nvidia-rtx-4090)
-- Optimize your ElizaOS configuration
-- Check if the Nosana inference endpoint is reachable
-
-**Out of credits?**
-- Visit [nosana.com/builders-credits](https://nosana.com/builders-credits) to check your balance
-- Credits are airdropped twice daily — be patient if you just signed up
-
-**Need help?**
-- Join the [Nosana Discord](https://nosana.com/discord) for support
-- Check the [Nosana documentation](https://learn.nosana.io)
-- Review the [Nosana CLI docs](https://github.com/nosana-ci/nosana-cli)
-
----
-
-## What You'll Build
-
-Your submission should include:
-- **A working AI agent** built with ElizaOS
-- **A frontend interface** to interact with your agent (web UI, chat interface, dashboard, etc.)
-- **Deployment on Nosana** — your agent must run on Nosana's decentralized infrastructure
-
-**The deeper your Nosana integration, the better your score.** We're looking for projects that fully embrace decentralized infrastructure — not just a minimal deployment, but thoughtful integration into your architecture.
-
-### Examples of Deep Integration (Better Scores):
-- Using Nosana for both training and inference
-- Multi-node deployments across Nosana's network
-- Custom deployment pipelines using Nosana CLI
-- Monitoring and observability integrated with Nosana infrastructure
-- Storage solutions that leverage decentralized networks
-- Creative use of Nosana's compute marketplace
-
----
-
-## Submission
-
-Submit your project via the official submission page: **[superteam.fun/earn/listing/nosana-builders-elizaos-challenge/](https://superteam.fun/earn/listing/nosana-builders-elizaos-challenge/)** before **April 14, 2026**.
-
-**Submission Checklist** — All items are required:
-
-- [ ] **Fork this repository** and build your agent on the `elizaos-challenge` branch
-- [ ] **Build a frontend/UI** for interacting with your agent
-- [ ] **Deploy to Nosana** and get your public deployment URL (agent must run on Nosana infrastructure)
-- [ ] **Star the following repositories:**
-  - [ ] [nosana-ci/agent-challenge](https://github.com/nosana-ci/agent-challenge)
-  - [ ] [nosana-ci/nosana-programs](https://github.com/nosana-ci/nosana-programs)
-  - [ ] [nosana-ci/nosana-kit](https://github.com/nosana-ci/nosana-kit)
-  - [ ] [nosana-ci/nosana-cli](https://github.com/nosana-ci/nosana-cli)
-- [ ] **Make a social media post** about your project on your platform of choice (X/Twitter, LinkedIn, Bluesky, Instagram, or other)
-- [ ] **Provide your GitHub fork link** (public repository)
-- [ ] **Provide your Nosana deployment URL** (running agent)
-- [ ] **Write a description** of your agent and what it does (≤300 words)
-- [ ] **Record a video demo** (<1 minute) showing your agent and frontend in action
-
-> **⚠️ Important:** Submissions that do not meet these requirements will not be considered.
-
-> For complete submission requirements and additional information, visit the [official challenge page](https://superteam.fun/earn/listing/nosana-builders-elizaos-challenge/).
-
----
-
-## Judging Criteria
-
-| Criterion | Weight |
-|-----------|--------|
-| Technical implementation | 25% |
-| Nosana integration depth | 25% |
-| Usefulness & UX | 25% |
-| Creativity & originality | 15% |
-| Documentation | 10% |
-
-**Judging Details:**
-- **Technical implementation (25%)** — Code quality, architecture, and ElizaOS best practices
-- **Nosana integration depth (25%)** — How deeply Nosana is integrated into your deployment and infrastructure
-- **Usefulness & UX (25%)** — Real-world applicability, frontend quality, and user experience
-- **Creativity & originality (15%)** — Innovative use cases and novel approaches
-- **Documentation (10%)** — Code quality, README, setup instructions
-
-**Judges:** DevRel Lead & Ecosystem Specialist, Nosana
-
----
-
-## Project Structure
+**In chat mode:**
 
 ```
-├── characters/
-│   └── agent.character.json   # Your agent's character definition
+› you: why is my prisma connection failing on Neon?
+
+  fixd: Your DATABASE_URL is using the direct connection string — Neon requires
+        the pooled URL for serverless environments. Add a separate DIRECT_URL for
+        migrations.
+
+  ─── agent wants to run ────────────────────────────────────────
+  $ npx prisma db push
+
+  run this command? › yes
+```
+
+---
+
+### Scaffold a new project
+
+```bash
+mkdir my-api && cd my-api
+fixd init
+```
+
+```
+  project name       my-api
+  backend framework  hono
+  database           postgres
+  postgres hosting   neon
+  orm                prisma
+  auth               better-auth
+  frontend           none
+  package manager    bun
+
+  scaffold this project? › yes
+
+  fetching latest docs...  ✔ fetched docs for: hono, prisma, better-auth
+  generating... (7 files so far)
+  ✔ created: package.json
+  ✔ created: tsconfig.json
+  ✔ created: src/index.ts
+  ✔ created: prisma/schema.prisma
+  ✔ created: src/lib/auth.ts
+  ✔ created: .env
+  ✔ created: .gitignore
+  ✔ git repository initialised with initial commit
+  ✔ dependencies installed
+```
+
+---
+
+### Check API + model status
+
+```bash
+fixd status
+```
+
+```
+  ✔ Groq API reachable
+  small model : meta-llama/llama-4-scout-17b-16e-instruct
+  large model : qwen/qwen3-32b
+  project     : /Users/you/my-project
+```
+
+---
+
+##  Folder Structure
+
+```
+fixd/
+├── cli/                        # CLI entry points and command implementations
+│   ├── index.ts                # Main entry — argument parsing, preflight, routing
+│   ├── doctor.ts               # Diagnose, fix, verify, and chat loop
+│   ├── init.ts                 # Guided project scaffolding
+│   ├── deploy.ts               # Dockerfile generation + Nosana deploy
+│   └── lib/
+│       ├── llm.ts              # Groq API client — ask(), askStream(), chat()
+│       ├── agent.ts            # Multi-turn conversation state management
+│       ├── diagnostics.ts      # Stack detection + parallel linter runner
+│       ├── memory.ts           # .fixd/memory.json read/write/summarize
+│       ├── context7.ts         # Context7 live doc fetching + prompt injection
+│       ├── patcher.ts          # <<WRITE:>> file diff proposal + apply
+│       ├── executor.ts         # Shell command extraction + execution
+│       └── display.ts          # Terminal UI: spinners, colours, prompts
+│
 ├── src/
-│   └── index.ts               # Custom plugin entry point (optional)
-├── nos_job_def/
-│   └── nosana_eliza_job_definition.json  # Nosana deployment config
-├── Dockerfile                 # Container configuration
-├── .env.example               # Environment variable template
-└── package.json
+│   └── actions/
+│       ├── scanFiles.ts        # Project scanner (env vars, package.json, tsconfig, prisma, ports)
+│       └── fixEnv.ts           # Deterministic issue detector + auto-fix rules
+│
+├── .fixd/                      # Auto-created per project — gitignored
+│   └── memory.json             # Persistent project memory (history, fixes, stack)
+│
+├── .env.example                # Environment variable template
+├── Dockerfile                  # Container build for Nosana deployment
+├── tsconfig.json               # TypeScript compiler config
+└── package.json                # Scripts and dependencies
 ```
 
 ---
 
-## Resources
+##  Internal APIs
 
-### ElizaOS
-- [ElizaOS Documentation](https://elizaos.github.io/eliza/docs) — Full framework docs
-- [ElizaOS Plugin Directory](https://elizaos.github.io/eliza/docs/core/plugins) — Browse available plugins
-- [ElizaOS GitHub](https://github.com/elizaos/eliza) — Source code and examples
-- [ElizaOS Discord](https://discord.gg/elizaos) — Community support
+fixd is a CLI tool and has no public HTTP API. The following describes the internal module contracts.
 
-### Nosana
-- [Nosana Documentation](https://docs.nosana.io) — Platform guide
-- [Nosana Dashboard](https://dashboard.nosana.com) — Deploy and manage jobs
-- [Nosana CLI](https://github.com/nosana-ci/nosana-cli) — Command-line deployment
-- [Nosana Discord](https://nosana.com/discord) — Support and endpoint URL
+### `cli/lib/llm.ts`
 
-### Qwen3.5
-- [Qwen3.5-27B on HuggingFace](https://huggingface.co/Qwen/Qwen3.5-27B)
+| Function | Description |
+|---|---|
+| `ask(prompt, task)` | Single-turn completion. Returns `string`. Routes to small or large model by task. |
+| `askStream(prompt, task)` | Streaming generator. Yields text chunks as they arrive. Used by `init`. |
+| `chat(messages, task)` | Multi-turn completion. Accepts a full `Message[]` history. |
 
----
+**Task routing:**
 
-## Support & Community
-
-- **Discord** — Join [Nosana Discord](https://nosana.com/discord) for support, the Nosana endpoint URL, and to connect with other builders
-- **Twitter/X** — Follow [@nosana_ai](https://x.com/nosana_ai) and [@elizaos](https://x.com/elizaos) for updates
-- **GitHub** — Open an issue in this repo if you find problems with the template
+| Task | Model |
+|---|---|
+| `classify`, `explain` | `llama-4-scout` (small, fast) |
+| `generate`, `diagnose` | `qwen3-32b` (large, accurate) |
+| `chat` | Auto-upgrades to large if the message looks like code generation |
 
 ---
 
-## Star History
+### `cli/lib/diagnostics.ts`
 
-<a href="https://www.star-history.com/?repos=nosana-ci%2Fagent-challenge&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=nosana-ci/agent-challenge&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=nosana-ci/agent-challenge&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=nosana-ci/agent-challenge&type=date&legend=top-left" />
- </picture>
-</a>
+| Function | Description |
+|---|---|
+| `runDiagnostics(projectPath)` | Auto-detects stack and runs all applicable checkers in parallel. Returns `CheckerResult[]`. |
+| `formatDiagnosticsForContext(results)` | Formats results as structured text for LLM prompt injection. |
+| `getAllErrors(results)` | Flattens all `ParsedError` objects across stacks into a single array. |
 
-## License
+**Supported stacks and tools:**
 
-This template is open source and available under the [MIT License](./LICENSE).
+| Stack | Tool |
+|---|---|
+| TypeScript | `tsc --noEmit` |
+| JavaScript | `eslint` (compact format) |
+| Python | `mypy`, `flake8` |
+| Rust | `cargo check` |
+| Go | `go vet` |
+| Ruby | `rubocop` |
+| PHP | `php -l`, `phpstan` |
+| Java | `mvn compile` |
+| Kotlin/Java | `gradle check` |
 
 ---
 
-**Built with ElizaOS · Deployed on Nosana · Powered by Qwen3.5**
+### `cli/lib/memory.ts`
+
+| Function | Description |
+|---|---|
+| `loadMemory(projectRoot)` | Reads `.fixd/memory.json`. Returns empty memory if missing. |
+| `saveMemory(memory)` | Atomically writes memory via temp file + rename. Never throws. |
+| `updateFromScan(memory, scan)` | Updates `knownStack` and `lastScanned` from a fresh scan. |
+| `recordFix(memory, fixes)` | Appends applied fixes to `fixedIssues` (capped at 50). |
+| `summarizeSession(memory, log)` | Asks LLM for a 2-sentence summary and appends to `chatSummaries`. |
+| `formatMemoryForPrompt(memory)` | Serializes memory as a prompt prefix for LLM context injection. |
+
+---
+
+### `cli/lib/context7.ts`
+
+| Function | Description |
+|---|---|
+| `resolveLibraryId(name)` | Maps a library name to a Context7 ID. Falls back to search API. |
+| `fetchDocs(libraryId, topic, maxTokens)` | Fetches documentation for a specific library and topic. |
+| `fetchDocsForStack(stack)` | Fetches docs for an entire chosen stack, capped at 12,000 tokens. |
+| `fetchDocsForQuery(query, projectLibraries)` | Fetches docs for libraries mentioned in a chat query. |
+| `formatDocsForPrompt(docs)` | Formats fetched docs as a prompt prefix for LLM injection. |
+
+---
+
+##  Contributing
+
+Pull requests are welcome. For significant changes, please open an issue first to discuss the direction.
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feat/your-feature`
+3. Commit your changes: `git commit -m "feat: add your feature"`
+4. Push and open a PR
+
+---
+
+##  License
+
+MIT © [Anuj Singh](https://github.com/anujs101)
+
+---
+
+<div align="center">
+
+Built with frustration by developers who are tired of debugging their debuggers.
+
+</div>

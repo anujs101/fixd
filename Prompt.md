@@ -1,332 +1,267 @@
 ```
-Fix three issues in the fixd CLI project.
+Fix `fixd init` file writing. Currently streams scaffold response but never writes 
+files to disk. Patch markers exist in patcher.ts but init never calls proposeAndApply.
 
-## Fix 1: Conversation memory across sessions
+## Problem
+`cli/init.ts` sends scaffold prompt, streams response, prints it — done. Nothing 
+written to disk. User gets a wall of text instead of an actual project.
 
-### Problem
-Every `fixd doctor` run starts cold. Agent has no memory of previous sessions,
-previously fixed issues, or project history.
+## Fix
 
-### Solution
-Build a simple persistent memory layer using a local JSON file at
-`{projectRoot}/.fixd/memory.json`. Not a database. Not embeddings. Just structured
-JSON that gets injected into every LLM system prompt.
+### Step 1: Scaffold prompt must enforce patch marker output
 
-### Build `cli/lib/memory.ts`
+In `cli/init.ts`, update `scaffoldPrompt` to explicitly require patch markers:
 
 ```typescript
-export interface ProjectMemory {
-  projectRoot: string;
-  lastScanned: string | null;          // ISO timestamp
-  fixedIssues: FixedIssue[];
-  knownStack: Partial<StackSnapshot>;
-  chatSummaries: ChatSummary[];        // rolling summaries of past sessions
-  userPreferences: Record<string, string>; // e.g. { "preferred_pkg_manager": "bun" }
-}
+const scaffoldPrompt = `
+${docsContext}
 
-interface FixedIssue {
-  type: string;
-  description: string;
-  fixedAt: string;        // ISO timestamp
-  filesChanged: string[];
-}
+Scaffold a complete new project with these specs:
+- Project name: ${projectName}
+- Backend framework: ${framework || "hono"}
+- Database: ${database || "postgres"}
+${dbHost ? `- Database hosting: ${dbHost}` : ""}
+- ORM: ${orm || "prisma"}
+- Auth: ${auth || "none"}
+- Frontend: ${frontend || "none"}
+- Package manager: ${pkgManager || "bun"}
+- Output directory: ${projectName}/
 
-interface StackSnapshot {
-  packageManager: string;
-  nodeVersion: string;
-  frameworks: string[];
-  orms: string[];
-  databases: string[];
-}
+OUTPUT RULES — follow exactly or files will not be created:
+1. Output EVERY file using this exact format:
+<<<WRITE: ${projectName}/path/to/file>>>
+full file content here
+<<<END>>>
 
-interface ChatSummary {
-  sessionDate: string;    // ISO timestamp
-  summary: string;        // 2-3 sentence summary of what happened
-  filesChanged: string[];
-}
+2. Files to generate (minimum):
+   - ${projectName}/package.json
+   - ${projectName}/tsconfig.json
+   - ${projectName}/.env
+   - ${projectName}/.env.example
+   - ${projectName}/.gitignore
+   - ${projectName}/README.md
+   - ${projectName}/src/index.ts (entry point)
+   ${orm === "prisma" ? `- ${projectName}/prisma/schema.prisma` : ""}
+   ${auth !== "none" ? `- ${projectName}/src/lib/auth.ts` : ""}
+
+3. After ALL file blocks, output exactly one line:
+   SCAFFOLD_COMPLETE
+
+4. No prose before the first <<<WRITE block.
+5. No explanations between file blocks.
+6. Use current syntax from the injected documentation above — not training data.
+`.trim();
 ```
 
-Functions:
+### Step 2: Collect full streamed response before parsing
 
-**`loadMemory(projectRoot: string): Promise<ProjectMemory>`**
-- Read `.fixd/memory.json`
-- Return empty ProjectMemory if file doesn't exist
-- Never throw
-
-**`saveMemory(memory: ProjectMemory): Promise<void>`**
-- Create `.fixd/` dir if needed
-- Write atomically (tmp → rename)
-- Never throw
-
-**`updateFromScan(memory: ProjectMemory, scan: ProjectScan): ProjectMemory`**
-- Update `lastScanned`, `knownStack` from scan result
-- Return updated memory (don't save — caller saves)
-
-**`recordFix(memory: ProjectMemory, results: PatchResult[]): ProjectMemory`**
-- Append each applied fix to `fixedIssues`
-- Cap `fixedIssues` at 50 entries (drop oldest)
-- Return updated memory
-
-**`summarizeSession(memory: ProjectMemory, sessionLog: string): Promise<ProjectMemory>`**
-- Call LLM with `task: "classify"` (small model, cheap):
-  ```
-  Summarize this fixd session in 2 sentences max. What was broken, what was fixed.
-  Session log: {sessionLog}
-  ```
-- Append result to `chatSummaries`
-- Cap `chatSummaries` at 10 entries
-- Return updated memory
-
-**`formatMemoryForPrompt(memory: ProjectMemory): string`**
-- Returns empty string if memory is essentially empty
-- Otherwise returns:
-  ```
-  --- PROJECT MEMORY ---
-  Last scanned: {lastScanned}
-  Stack: {frameworks}, {orms}, {packageManager}
-  
-  Previously fixed:
-  - {type}: {description} (fixed {date})
-  
-  Past sessions:
-  - {date}: {summary}
-  --- END MEMORY ---
-  ```
-- Keep under 500 tokens total — truncate old fixes if needed
-
-### Integration: `cli/lib/agent.ts`
+Currently init streams chunks and prints them. Change to collect first, then parse and write:
 
 ```typescript
-import { loadMemory, formatMemoryForPrompt } from "./memory.js";
+// in runInit(), replace the streaming display block:
 
-// in sendMessage() or buildSystemPrompt():
-const memory = await loadMemory(process.cwd());
-const memoryContext = formatMemoryForPrompt(memory);
+section("scaffolding");
+const s = spin("generating project...");
 
-// prepend to system prompt:
-const fullSystemPrompt = memoryContext
-  ? `${memoryContext}\n\n${baseSystemPrompt}`
-  : baseSystemPrompt;
-```
-
-### Integration: `cli/doctor.ts`
-
-```typescript
-import { loadMemory, saveMemory, updateFromScan, recordFix, summarizeSession } from "./lib/memory.js";
-
-// at start of runDoctor():
-const memory = await loadMemory(projectPath);
-
-// after scan:
-const updatedMemory = updateFromScan(memory, scan);
-await saveMemory(updatedMemory);
-
-// after fixes applied (in the fix loop):
-const memoryAfterFix = recordFix(updatedMemory, allPatchResults);
-await saveMemory(memoryAfterFix);
-
-// at end of session (before bye()):
-// collect sessionLog = all agent responses + user inputs concatenated
-const finalMemory = await summarizeSession(memoryAfterFix, sessionLog);
-await saveMemory(finalMemory);
-```
-
-Add `.fixd/` to `.gitignore` — project memory is local, not committed.
-
----
-
-## Fix 2: Groq 429 rate limit handling
-
-### Problem
-Groq free tier hits rate limits. Currently unhandled — crashes with unreadable error.
-
-### Solution
-In `cli/lib/llm.ts`, wrap every API call with retry + backoff + clear user messaging.
-
-```typescript
-// Replace current fetch call with this wrapper:
-
-interface GroqError {
-  error: {
-    message: string;
-    type: string;
-    code: string;
-  };
-}
-
-async function groqFetch(
-  body: object,
-  retries = 3
-): Promise<Response> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    const res = await fetch(`${GROQ_BASE}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    });
-
-    if (res.ok) return res;
-
-    if (res.status === 429) {
-      // parse retry-after header if present
-      const retryAfter = res.headers.get("retry-after");
-      const waitSeconds = retryAfter ? parseInt(retryAfter) : attempt * 15;
-
-      if (attempt < retries) {
-        // show spinner with countdown
-        const s = spin(`rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
-        await sleep(waitSeconds * 1000);
-        s.stop();
-        continue;
-      }
-
-      // final attempt failed
-      throw new Error(
-        `Groq rate limit exceeded. Wait ${waitSeconds}s and retry.\n` +
-        `Tip: reduce usage or upgrade at console.groq.com`
-      );
-    }
-
-    if (res.status === 401) {
-      throw new Error("Invalid GROQ_API_KEY. Check your .env file.");
-    }
-
-    if (res.status === 503 || res.status === 502) {
-      if (attempt < retries) {
-        const wait = attempt * 5;
-        const s = spin(`Groq unavailable — retrying in ${wait}s...`);
-        await sleep(wait * 1000);
-        s.stop();
-        continue;
-      }
-      throw new Error("Groq API is currently unavailable. Try again in a moment.");
-    }
-
-    // other errors — parse and throw clean message
-    const errBody = await res.json().catch(() => null) as GroqError | null;
-    throw new Error(
-      errBody?.error?.message ?? `Groq API error ${res.status}`
-    );
-  }
-
-  throw new Error("Groq request failed after all retries.");
-}
-```
-
-Also add startup validation in `cli/index.ts`:
-
-```typescript
-// in preflight() after checkHealth():
-async function validateGroqKey(): Promise<boolean> {
-  if (!process.env.GROQ_API_KEY) {
-    error("GROQ_API_KEY not set — add it to your .env file");
-    info("get a free key at console.groq.com");
-    return false;
-  }
-
-  // lightweight test call — 1 token, cheapest model
-  try {
-    await ask("hi", "classify");
-    return true;
-  } catch (err: any) {
-    error(`Groq API error: ${err.message}`);
-    return false;
-  }
-}
-```
-
-Add model fallback — if large model (qwen3-32b) fails, retry with small model:
-
-```typescript
-// in ask() for task === "generate" or "diagnose":
+// collect full response — don't stream print (patch markers need full text)
+let fullResponse = "";
 try {
-  return await groqFetch({ model: LARGE_MODEL, ...body });
-} catch (err: any) {
-  if (err.message.includes("rate limit") || err.message.includes("unavailable")) {
-    warn(`${LARGE_MODEL} unavailable — falling back to ${SMALL_MODEL}`);
-    return await groqFetch({ model: SMALL_MODEL, ...body });
+  for await (const chunk of askStream(scaffoldPrompt, "generate")) {
+    fullResponse += chunk;
+    // show progress without printing raw text
+    if (fullResponse.includes("<<<WRITE:")) {
+      const fileCount = (fullResponse.match(/<<<WRITE:/g) ?? []).length;
+      s.text = `generating... (${fileCount} file${fileCount > 1 ? "s" : ""} so far)`;
+    }
   }
-  throw err;
+} catch (err: any) {
+  s.stop();
+  warn(err.message);
+  closePrompt();
+  return;
+}
+
+s.stop();
+
+// strip think blocks
+const clean = fullResponse.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+
+// check we got something
+if (!clean.includes("<<<WRITE:")) {
+  warn("agent did not output any files — raw response:");
+  console.log(chalk.dim(clean.slice(0, 500)));
+  closePrompt();
+  return;
 }
 ```
 
----
-
-## Fix 3: Verify step after auto-fix
-
-### Problem
-After fixes are applied, fixd never confirms the project is actually clean.
-User has no way to know if the fixes worked without manually re-running.
-
-### Solution
-After fix loop in `cli/doctor.ts`, re-run scan + diagnostics and compare.
+### Step 3: Parse and write files using patcher
 
 ```typescript
-// after fix loop, before dropping into chat mode:
+import { proposeAndApply } from "./lib/patcher.js";
+import path from "node:path";
+import fs from "node:fs/promises";
 
-if (autoFixable.length > 0 && shouldFix) {
-  const verifySpinner = spin("verifying fixes...");
+// after collecting fullResponse:
+const outputDir = path.join(process.cwd(), projectName);
 
-  // re-run full scan + diagnostics
-  const [scanAfter, diagAfter] = await Promise.all([
-    scanProject(projectPath).catch(() => null),
-    runDiagnostics(projectPath).catch(() => []),
-  ]);
+// create output directory
+try {
+  await fs.mkdir(outputDir, { recursive: true });
+} catch (err: any) {
+  warn(`could not create ${outputDir}: ${err.message}`);
+  closePrompt();
+  return;
+}
 
-  verifySpinner.stop();
-  section("verification");
+section("writing files");
 
-  if (!scanAfter) {
-    warn("could not re-scan project — verify manually");
-  } else {
-    const issuesAfter = detectIssues(scanAfter, projectPath);
-    const diagErrorsAfter = getAllErrors(diagAfter);
+// use autoApprove — user already confirmed the full scaffold
+const results = await proposeAndApply(clean, outputDir, {
+  autoApprove: true,
+  // override path resolution — patcher resolves relative to outputDir
+  // but agent outputs paths like "myproject/src/index.ts"
+  // strip the projectName prefix since outputDir already is the project root
+  pathPrefix: projectName,
+});
 
-    // compare before vs after
-    const resolvedCount = issues.length - issuesAfter.length;
-    const newIssueCount = issuesAfter.filter(
-      a => !issues.some(b => b.type === a.type)
-    ).length;
+const written  = results.filter(r => r.applied);
+const failed   = results.filter(r => !r.applied);
 
-    if (resolvedCount > 0) {
-      success(`${resolvedCount} issue${resolvedCount > 1 ? "s" : ""} resolved`);
+for (const r of written) {
+  success(`created: ${r.path}`);
+}
+for (const r of failed) {
+  warn(`failed:  ${r.path} — ${r.error}`);
+}
+
+if (written.length === 0) {
+  warn("no files written — check agent output format");
+  closePrompt();
+  return;
+}
+```
+
+### Step 4: Run post-scaffold setup commands
+
+After files written, run git init + install:
+
+```typescript
+import { runCommand } from "./lib/executor.js";
+
+section("setup");
+
+// git init
+const gitResult = await runCommand("git init", outputDir);
+if (gitResult.exitCode === 0) {
+  success("git init");
+  await runCommand(`git add . && git commit -m "init: fixd scaffold"`, outputDir);
+  success("initial commit");
+} else {
+  warn("git init failed — init manually");
+}
+
+// install dependencies
+const installCmd = pkgManager === "bun"  ? "bun install"
+                 : pkgManager === "pnpm" ? "pnpm install"
+                 : pkgManager === "yarn" ? "yarn"
+                 : "npm install";
+
+info(`running ${installCmd}...`);
+const installSpinner = spin("installing dependencies...");
+const installResult  = await runCommand(installCmd, outputDir);
+installSpinner.stop();
+
+if (installResult.exitCode === 0) {
+  success("dependencies installed");
+} else {
+  warn("install failed — run manually:");
+  console.log(`  cd ${projectName} && ${installCmd}`);
+}
+```
+
+### Step 5: Fix path prefix stripping in `cli/lib/patcher.ts`
+
+Agent outputs paths like `myproject/src/index.ts` but `outputDir` is already 
+`/abs/path/to/myproject`. Need to strip the project name prefix.
+
+Add `pathPrefix` option to `ApplyOptions` and strip in `parsePatchOperations`:
+
+```typescript
+// in patcher.ts, update parsePatchOperations to accept options:
+export function parsePatchOperations(
+  agentText: string,
+  options?: { pathPrefix?: string }
+): PatchOperation[] {
+  // after extracting path from <<<WRITE: path>>>:
+  let resolvedPath = extractedPath.trim();
+  
+  // strip projectName prefix if present
+  if (options?.pathPrefix) {
+    const prefix = options.pathPrefix.replace(/\/?$/, "/");
+    if (resolvedPath.startsWith(prefix)) {
+      resolvedPath = resolvedPath.slice(prefix.length);
     }
-
-    if (newIssueCount > 0) {
-      warn(`${newIssueCount} new issue${newIssueCount > 1 ? "s" : ""} detected after fix`);
-      for (const i of issuesAfter.filter(a => !issues.some(b => b.type === a.type))) {
-        printIssue(i.severity, i.type);
-        console.log(`     ${chalk.dim(i.description)}`);
-      }
-    }
-
-    if (diagErrorsAfter.length === 0 && issuesAfter.length === 0) {
-      success("project is clean");
-    } else if (diagErrorsAfter.length > 0) {
-      warn(`${diagErrorsAfter.length} diagnostic error${diagErrorsAfter.length > 1 ? "s" : ""} remain`);
-      for (const e of diagErrorsAfter.slice(0, 5)) {
-        const loc = e.file ? `${e.file}:${e.line ?? ""}` : "";
-        console.log(`     ${chalk.dim(loc)} ${chalk.red(e.code ?? "")} ${e.message}`);
-      }
-    }
-
-    // update memory with verify result
-    if (scanAfter) {
-      const verifiedMemory = updateFromScan(memory, scanAfter);
-      await saveMemory(verifiedMemory);
+    // also handle without trailing slash
+    if (resolvedPath.startsWith(options.pathPrefix + "/")) {
+      resolvedPath = resolvedPath.slice(options.pathPrefix.length + 1);
     }
   }
+  
+  // ... rest of parsing
 }
+```
+
+Pass pathPrefix through `proposeAndApply` → `applyPatchSet` → `parsePatchOperations`.
+
+### Step 6: Expected output after fix
+
+```
+  your stack
+  ────────────────────────────────────────
+  project      my-api
+  framework    hono
+  database     postgres
+  db host      neon
+  orm          prisma
+  auth         better-auth
+  pkg manager  bun
+
+  ? scaffold this project? (y/n) › y
+
+  ⠋ fetching latest docs...
+  ℹ fetched docs for: hono, prisma
+
+  scaffolding
+  ────────────────────────────────────────
+  ⠋ generating... (6 files so far)
+
+  writing files
+  ────────────────────────────────────────
+  ✔ created: package.json
+  ✔ created: tsconfig.json
+  ✔ created: .env
+  ✔ created: .env.example
+  ✔ created: .gitignore
+  ✔ created: src/index.ts
+  ✔ created: prisma/schema.prisma
+  ✔ created: src/lib/auth.ts
+  ✔ created: README.md
+
+  setup
+  ────────────────────────────────────────
+  ✔ git init
+  ✔ initial commit
+  ✔ dependencies installed
+
+  goodbye.
 ```
 
 ## Do not touch
 - `cli/lib/display.ts`
 - `cli/lib/diagnostics.ts`
 - `cli/lib/executor.ts`
-- `cli/lib/patcher.ts`
 - `cli/lib/context7.ts`
+- `cli/lib/memory.ts`
 - `src/actions/`
 ```
