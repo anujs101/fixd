@@ -44,10 +44,10 @@ next-env.d.ts
 .mastra
 .fixd/
 
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-/node_modules
+# compiled binaries
+fixd
+dist/
+build/
 /.pnp
 .pnp.*
 .yarn/*
