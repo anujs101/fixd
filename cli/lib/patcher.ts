@@ -180,8 +180,125 @@ function findSearchIndex(fileLines: string[], searchLines: string[]): number {
 function normalizeWs(s: string): string {
     return s.replace(/\r\n/g, "\n").replace(/\t/g, "    ").trimEnd();
 }
+// ─── JSON-aware patch helpers ────────────────────────────────────────────────
 
-// ─── Apply single operation ───────────────────────────────────────────────────
+/**
+ * Deep-merge `override` into `base`. Arrays in override fully replace base arrays.
+ */
+function deepMerge(base: any, override: any): any {
+    if (
+        typeof base !== "object" || base === null ||
+        typeof override !== "object" || override === null ||
+        Array.isArray(override)
+    ) {
+        return override;
+    }
+    const result = { ...base };
+    for (const key of Object.keys(override)) {
+        if (
+            key in base &&
+            typeof base[key] === "object" && base[key] !== null &&
+            typeof override[key] === "object" && override[key] !== null &&
+            !Array.isArray(base[key]) && !Array.isArray(override[key])
+        ) {
+            result[key] = deepMerge(base[key], override[key]);
+        } else {
+            result[key] = override[key];
+        }
+    }
+    return result;
+}
+
+/**
+ * Line-by-line diff of two pretty-printed JSON objects.
+ */
+function generateJsonDiff(before: any, after: any): string {
+    const beforeStr = JSON.stringify(before, null, 2).split("\n");
+    const afterStr  = JSON.stringify(after,  null, 2).split("\n");
+    const lines: string[] = [];
+
+    const maxLen = Math.max(beforeStr.length, afterStr.length);
+    for (let i = 0; i < maxLen; i++) {
+        const b = beforeStr[i];
+        const a = afterStr[i];
+        if (b === a) {
+            lines.push(`  ${a ?? ""}`);
+        } else {
+            if (b !== undefined) lines.push(`- ${b}`);
+            if (a !== undefined) lines.push(`+ ${a}`);
+        }
+    }
+    return lines.join("\n");
+}
+
+/**
+ * JSON-aware edit: parse file + replace block as JSON, deep-merge, write back.
+ * Falls back to string-based patching if either side is not valid JSON.
+ */
+async function applyJsonPatch(
+    op: Extract<PatchOperation, { op: "edit" }>,
+    projectRoot: string,
+    abs: string
+): Promise<PatchResult> {
+    try {
+        const raw = await fs.readFile(abs, "utf-8");
+        const current = JSON.parse(raw);
+
+        let replacement: Record<string, any>;
+        try {
+            replacement = JSON.parse(op.replace);
+        } catch {
+            // replace block isn't valid JSON — fall through to string-based patch
+            return applyStringPatch(op, projectRoot, abs, raw);
+        }
+
+        const merged = deepMerge(current, replacement);
+        const newContent = JSON.stringify(merged, null, 2) + "\n";
+        const diff = generateJsonDiff(current, merged);
+
+        await atomicWrite(abs, newContent);
+
+        return { op: "edit", path: op.path, applied: true, diff };
+    } catch (err: any) {
+        return { op: "edit", path: op.path, applied: false, diff: "", error: err.message };
+    }
+}
+
+/**
+ * String-based edit — the existing search/replace logic, extracted for reuse.
+ */
+async function applyStringPatch(
+    op: Extract<PatchOperation, { op: "edit" }>,
+    projectRoot: string,
+    abs: string,
+    original?: string
+): Promise<PatchResult> {
+    const content = original ?? await fs.readFile(abs, "utf-8").catch(() => null);
+    if (content === null) {
+        return { op: "edit", path: op.path, applied: false, diff: "", error: "file not found" };
+    }
+
+    // Exact match
+    if (content.includes(op.search)) {
+        const updated = content.replace(op.search, op.replace);
+        await atomicWrite(abs, updated);
+        const diff = contextDiff(content, op.search, op.replace);
+        return { op: "edit", path: op.path, applied: true, diff };
+    }
+
+    // Whitespace-normalised retry
+    const normOrig   = normalizeWs(content);
+    const normSearch = normalizeWs(op.search);
+    if (normOrig.includes(normSearch)) {
+        const updated = normOrig.replace(normSearch, normalizeWs(op.replace));
+        await atomicWrite(abs, updated);
+        const diff = contextDiff(content, op.search, op.replace);
+        return { op: "edit", path: op.path, applied: true, diff };
+    }
+
+    return { op: "edit", path: op.path, applied: false, diff: "", error: "search string not found in file" };
+}
+
 
 export async function applyPatch(op: PatchOperation, projectRoot: string): Promise<PatchResult> {
     const abs = path.resolve(projectRoot, op.path);
@@ -203,32 +320,11 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
             }
 
             case "edit": {
-                let original: string;
-                try { original = await fs.readFile(abs, "utf-8"); }
-                catch { return { op: "edit", path: op.path, applied: false, diff: "", error: "file not found" }; }
-
-                // Exact match first
-                if (original.includes(op.search)) {
-                    const updated = original.replace(op.search, op.replace);
-                    await atomicWrite(abs, updated);
-                    const diff = contextDiff(original, op.search, op.replace);
-                    return { op: "edit", path: op.path, applied: true, diff };
+                // JSON files get deep-merge patching first
+                if (op.path.endsWith(".json")) {
+                    return applyJsonPatch(op, projectRoot, abs);
                 }
-
-                // Whitespace-normalized retry
-                const normOrig   = normalizeWs(original);
-                const normSearch = normalizeWs(op.search);
-                if (normOrig.includes(normSearch)) {
-                    const updated = normOrig.replace(normSearch, normalizeWs(op.replace));
-                    await atomicWrite(abs, updated);
-                    const diff = contextDiff(original, op.search, op.replace);
-                    return { op: "edit", path: op.path, applied: true, diff };
-                }
-
-                return {
-                    op: "edit", path: op.path, applied: false, diff: "",
-                    error: "search string not found in file",
-                };
+                return applyStringPatch(op, projectRoot, abs);
             }
 
             case "delete": {

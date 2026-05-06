@@ -157,13 +157,21 @@ export function extractPendingCommands(
     }
 
     // 4. Agent's entire <text> content is a command (no code fence, plain response)
-    //    e.g. agent just output "bun i --silent" with nothing else
+    //    e.g. agent just output "bun i --silent" with nothing else.
+    //    Only match if the first token is a KNOWN_BINS entry or the line starts with
+    //    a shell-path prefix ($, ./, /) — never treat plain English sentences as commands.
     const textMatch = agentText.match(/<text>([\s\S]*?)<\/text>/i);
     const rawText = textMatch ? textMatch[1].trim() : agentText.replace(/<[^>]+>/g, "").trim();
     const singleLines = rawText.split("\n").map((l) => l.trim()).filter(Boolean);
 
-    if (singleLines.length === 1 && looksLikeCommand(singleLines[0])) {
-        add(singleLines[0], "agent suggested this command");
+    if (singleLines.length === 1) {
+        const line = singleLines[0];
+        const firstToken = line.split(/\s+/)[0].replace(/^\.?\/?/, "");
+        const isKnownBin = KNOWN_BINS.has(firstToken);
+        const hasShellPrefix = /^(\$\s|\.\/|\/[a-z])/.test(line);
+        if ((isKnownBin || hasShellPrefix) && looksLikeCommand(line)) {
+            add(line, "agent suggested this command");
+        }
     }
 
     return commands;
@@ -205,29 +213,32 @@ export async function runCommand(command: string, cwd: string): Promise<CommandR
 // ─── Format result for agent ──────────────────────────────────────────────────
 
 export function formatResultForAgent(result: CommandResult): string {
+    const stdout = result.stdout.trim();
+    const stderr = result.stderr.trim();
+
     const lines = [
         `Command \`${result.command}\` ran (as \`${result.resolvedCommand}\`), exit code ${result.exitCode}, took ${result.durationMs}ms.`,
         "",
     ];
 
-    if (result.stdout) {
-        lines.push("STDOUT:", "```", result.stdout, "```", "");
+    if (stdout) {
+        lines.push("STDOUT:", "```", stdout, "```", "");
     } else {
         lines.push("STDOUT: (no output)", "");
     }
 
-    if (result.stderr) {
-        lines.push("STDERR:", "```", result.stderr, "```", "");
+    if (stderr) {
+        lines.push("STDERR:", "```", stderr, "```", "");
     }
 
-    if (result.exitCode === 0 && !result.stdout && !result.stderr) {
+    if (result.exitCode === 0 && !stdout && !stderr) {
         lines.push(
             "The command produced NO output and exited cleanly — this means no errors were found.",
             "Do NOT suggest running the same command again.",
-            "Report this result to the user and move on."
+            "Report this result to the user in one sentence and STOP."
         );
     } else if (result.exitCode === 0) {
-        lines.push("Command succeeded. Analyse the output above and report any issues found.");
+        lines.push("Command succeeded. Report any notable findings from the output above in max 2 sentences, then STOP.");
     } else {
         lines.push("Command failed. Diagnose the error above and suggest the fix.");
     }

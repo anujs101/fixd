@@ -1,267 +1,388 @@
+Two problems. Agent doesn't read actual files before answering, and it recommends instead of executes.
+
 ```
-Fix `fixd init` file writing. Currently streams scaffold response but never writes 
-files to disk. Patch markers exist in patcher.ts but init never calls proposeAndApply.
+Fix `fixd doctor` chat mode. Two critical issues:
 
-## Problem
-`cli/init.ts` sends scaffold prompt, streams response, prints it — done. Nothing 
-written to disk. User gets a wall of text instead of an actual project.
+## Problem 1: Agent never reads actual project files
+When user asks "analyse this project", agent guesses from scan metadata.
+It should read actual file contents before responding.
 
-## Fix
+## Fix: Add file reading to agenticTurn context pipeline
 
-### Step 1: Scaffold prompt must enforce patch marker output
-
-In `cli/init.ts`, update `scaffoldPrompt` to explicitly require patch markers:
+In `cli/lib/` create `projectReader.ts`:
 
 ```typescript
-const scaffoldPrompt = `
-${docsContext}
-
-Scaffold a complete new project with these specs:
-- Project name: ${projectName}
-- Backend framework: ${framework || "hono"}
-- Database: ${database || "postgres"}
-${dbHost ? `- Database hosting: ${dbHost}` : ""}
-- ORM: ${orm || "prisma"}
-- Auth: ${auth || "none"}
-- Frontend: ${frontend || "none"}
-- Package manager: ${pkgManager || "bun"}
-- Output directory: ${projectName}/
-
-OUTPUT RULES — follow exactly or files will not be created:
-1. Output EVERY file using this exact format:
-<<<WRITE: ${projectName}/path/to/file>>>
-full file content here
-<<<END>>>
-
-2. Files to generate (minimum):
-   - ${projectName}/package.json
-   - ${projectName}/tsconfig.json
-   - ${projectName}/.env
-   - ${projectName}/.env.example
-   - ${projectName}/.gitignore
-   - ${projectName}/README.md
-   - ${projectName}/src/index.ts (entry point)
-   ${orm === "prisma" ? `- ${projectName}/prisma/schema.prisma` : ""}
-   ${auth !== "none" ? `- ${projectName}/src/lib/auth.ts` : ""}
-
-3. After ALL file blocks, output exactly one line:
-   SCAFFOLD_COMPLETE
-
-4. No prose before the first <<<WRITE block.
-5. No explanations between file blocks.
-6. Use current syntax from the injected documentation above — not training data.
-`.trim();
-```
-
-### Step 2: Collect full streamed response before parsing
-
-Currently init streams chunks and prints them. Change to collect first, then parse and write:
-
-```typescript
-// in runInit(), replace the streaming display block:
-
-section("scaffolding");
-const s = spin("generating project...");
-
-// collect full response — don't stream print (patch markers need full text)
-let fullResponse = "";
-try {
-  for await (const chunk of askStream(scaffoldPrompt, "generate")) {
-    fullResponse += chunk;
-    // show progress without printing raw text
-    if (fullResponse.includes("<<<WRITE:")) {
-      const fileCount = (fullResponse.match(/<<<WRITE:/g) ?? []).length;
-      s.text = `generating... (${fileCount} file${fileCount > 1 ? "s" : ""} so far)`;
-    }
-  }
-} catch (err: any) {
-  s.stop();
-  warn(err.message);
-  closePrompt();
-  return;
-}
-
-s.stop();
-
-// strip think blocks
-const clean = fullResponse.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-
-// check we got something
-if (!clean.includes("<<<WRITE:")) {
-  warn("agent did not output any files — raw response:");
-  console.log(chalk.dim(clean.slice(0, 500)));
-  closePrompt();
-  return;
-}
-```
-
-### Step 3: Parse and write files using patcher
-
-```typescript
-import { proposeAndApply } from "./lib/patcher.js";
-import path from "node:path";
 import fs from "node:fs/promises";
+import path from "node:path";
 
-// after collecting fullResponse:
-const outputDir = path.join(process.cwd(), projectName);
+const MAX_FILE_SIZE = 50_000; // 50kb per file
+const MAX_TOTAL_TOKENS = 8_000;
 
-// create output directory
-try {
-  await fs.mkdir(outputDir, { recursive: true });
-} catch (err: any) {
-  warn(`could not create ${outputDir}: ${err.message}`);
-  closePrompt();
-  return;
-}
+const ALWAYS_READ = [
+  "package.json",
+  "tsconfig.json",
+  ".env.example",
+  "README.md",
+];
 
-section("writing files");
+const CODE_EXTENSIONS = [
+  ".ts", ".tsx", ".js", ".mjs",
+  ".json", ".yaml", ".yml",
+  ".prisma", ".env.example",
+];
 
-// use autoApprove — user already confirmed the full scaffold
-const results = await proposeAndApply(clean, outputDir, {
-  autoApprove: true,
-  // override path resolution — patcher resolves relative to outputDir
-  // but agent outputs paths like "myproject/src/index.ts"
-  // strip the projectName prefix since outputDir already is the project root
-  pathPrefix: projectName,
-});
+// Read files relevant to a user query
+export async function readRelevantFiles(
+  query: string,
+  projectRoot: string,
+): Promise<string> {
+  const sections: string[] = [];
+  let totalChars = 0;
+  const charLimit = MAX_TOTAL_TOKENS * 4; // ~4 chars per token
 
-const written  = results.filter(r => r.applied);
-const failed   = results.filter(r => !r.applied);
+  // Always read core config files first
+  for (const f of ALWAYS_READ) {
+    const content = await safeRead(path.join(projectRoot, f));
+    if (!content) continue;
+    const snippet = `FILE: ${f}\n\`\`\`\n${content}\n\`\`\``;
+    sections.push(snippet);
+    totalChars += snippet.length;
+    if (totalChars > charLimit) break;
+  }
 
-for (const r of written) {
-  success(`created: ${r.path}`);
-}
-for (const r of failed) {
-  warn(`failed:  ${r.path} — ${r.error}`);
-}
-
-if (written.length === 0) {
-  warn("no files written — check agent output format");
-  closePrompt();
-  return;
-}
-```
-
-### Step 4: Run post-scaffold setup commands
-
-After files written, run git init + install:
-
-```typescript
-import { runCommand } from "./lib/executor.js";
-
-section("setup");
-
-// git init
-const gitResult = await runCommand("git init", outputDir);
-if (gitResult.exitCode === 0) {
-  success("git init");
-  await runCommand(`git add . && git commit -m "init: fixd scaffold"`, outputDir);
-  success("initial commit");
-} else {
-  warn("git init failed — init manually");
-}
-
-// install dependencies
-const installCmd = pkgManager === "bun"  ? "bun install"
-                 : pkgManager === "pnpm" ? "pnpm install"
-                 : pkgManager === "yarn" ? "yarn"
-                 : "npm install";
-
-info(`running ${installCmd}...`);
-const installSpinner = spin("installing dependencies...");
-const installResult  = await runCommand(installCmd, outputDir);
-installSpinner.stop();
-
-if (installResult.exitCode === 0) {
-  success("dependencies installed");
-} else {
-  warn("install failed — run manually:");
-  console.log(`  cd ${projectName} && ${installCmd}`);
-}
-```
-
-### Step 5: Fix path prefix stripping in `cli/lib/patcher.ts`
-
-Agent outputs paths like `myproject/src/index.ts` but `outputDir` is already 
-`/abs/path/to/myproject`. Need to strip the project name prefix.
-
-Add `pathPrefix` option to `ApplyOptions` and strip in `parsePatchOperations`:
-
-```typescript
-// in patcher.ts, update parsePatchOperations to accept options:
-export function parsePatchOperations(
-  agentText: string,
-  options?: { pathPrefix?: string }
-): PatchOperation[] {
-  // after extracting path from <<<WRITE: path>>>:
-  let resolvedPath = extractedPath.trim();
+  // Query-driven file reading
+  const queryLower = query.toLowerCase();
   
-  // strip projectName prefix if present
-  if (options?.pathPrefix) {
-    const prefix = options.pathPrefix.replace(/\/?$/, "/");
-    if (resolvedPath.startsWith(prefix)) {
-      resolvedPath = resolvedPath.slice(prefix.length);
-    }
-    // also handle without trailing slash
-    if (resolvedPath.startsWith(options.pathPrefix + "/")) {
-      resolvedPath = resolvedPath.slice(options.pathPrefix.length + 1);
-    }
+  // detect which src files to read based on query keywords
+  const targets: string[] = [];
+  
+  if (queryLower.includes("src") || queryLower.includes("source") || queryLower.includes("analyse") || queryLower.includes("analyze") || queryLower.includes("summary") || queryLower.includes("project")) {
+    // read all src files up to limit
+    targets.push(...await listFiles(path.join(projectRoot, "src"), CODE_EXTENSIONS));
+    targets.push(...await listFiles(path.join(projectRoot, "cli"), CODE_EXTENSIONS));
   }
   
-  // ... rest of parsing
+  if (queryLower.includes("action") || queryLower.includes("scan") || queryLower.includes("fix")) {
+    targets.push(...await listFiles(path.join(projectRoot, "src/actions"), CODE_EXTENSIONS));
+  }
+
+  if (queryLower.includes("prisma") || queryLower.includes("schema") || queryLower.includes("database")) {
+    targets.push(...await listFiles(path.join(projectRoot, "prisma"), CODE_EXTENSIONS));
+  }
+
+  if (queryLower.includes("cli") || queryLower.includes("command") || queryLower.includes("doctor") || queryLower.includes("init")) {
+    targets.push(...await listFiles(path.join(projectRoot, "cli"), CODE_EXTENSIONS));
+  }
+
+  // dedupe
+  const unique = [...new Set(targets)];
+
+  for (const filePath of unique) {
+    if (totalChars > charLimit) break;
+    const rel = path.relative(projectRoot, filePath);
+    // skip already-read files
+    if (ALWAYS_READ.includes(rel)) continue;
+    const content = await safeRead(filePath);
+    if (!content) continue;
+    const snippet = `FILE: ${rel}\n\`\`\`\n${content.slice(0, MAX_FILE_SIZE)}\n\`\`\``;
+    sections.push(snippet);
+    totalChars += snippet.length;
+  }
+
+  if (sections.length === 0) return "";
+
+  return [
+    "--- PROJECT FILES (read from disk, authoritative) ---",
+    ...sections,
+    "--- END PROJECT FILES ---",
+  ].join("\n\n");
+}
+
+async function safeRead(filePath: string): Promise<string | null> {
+  try {
+    const stat = await fs.stat(filePath);
+    if (stat.size > MAX_FILE_SIZE) return null;
+    return await fs.readFile(filePath, "utf-8");
+  } catch {
+    return null;
+  }
+}
+
+async function listFiles(dir: string, exts: string[]): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const files: string[] = [];
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        files.push(...await listFiles(full, exts));
+      } else if (exts.some(ext => e.name.endsWith(ext))) {
+        files.push(full);
+      }
+    }
+    return files;
+  } catch {
+    return [];
+  }
 }
 ```
 
-Pass pathPrefix through `proposeAndApply` → `applyPatchSet` → `parsePatchOperations`.
+## Problem 2: Agent recommends instead of executes
 
-### Step 6: Expected output after fix
+When user says "fix them" agent should immediately output patch markers
+and/or bash blocks — not describe what to do.
+
+### Fix: Update `agenticTurn` in `cli/doctor.ts`
+
+```typescript
+import { readRelevantFiles } from "./lib/projectReader.js";
+
+async function agenticTurn(
+  userMessage: string,
+  projectPath: string,
+  depth = 0,
+  alreadyRan: Set<string> = new Set()
+): Promise<void> {
+  const MAX_DEPTH = 6;
+  if (depth > MAX_DEPTH) {
+    info("(max tool calls reached for this turn)");
+    return;
+  }
+
+  // READ FILES BEFORE EVERY TOP-LEVEL TURN
+  let fileContext = "";
+  if (depth === 0) {
+    const readSpinner = spin("reading project files...");
+    fileContext = await readRelevantFiles(userMessage, projectPath)
+      .catch(() => "");
+    readSpinner.stop();
+  }
+
+  const isFixRequest = /fix|apply|implement|create|add|remove|update|change/i.test(userMessage);
+
+  const fixInstruction = isFixRequest ? `
+EXECUTE DON'T EXPLAIN:
+- If fixing a file: output patch markers immediately, no preamble
+- If running a command: output bash block immediately
+- Do not describe what you will do — just do it
+- After patch markers: one sentence max explaining what changed
+` : `
+RESPOND FORMAT:
+- Answer directly from file contents above
+- Max 4 lines unless showing code
+- No "I will", "Let me", "Sure" openers
+- Start answer immediately
+`;
+
+  const fullMessage = [
+    fileContext,
+    `[Working directory: ${projectPath}]`,
+    "",
+    userMessage,
+    "",
+    fixInstruction,
+  ].filter(Boolean).join("\n");
+
+  const thinkSpinner = spin(
+    depth === 0
+      ? "thinking..."
+      : "agent analysing output..."
+  );
+
+  const responses = await sendMessage(fullMessage, "chat").catch((err: any) => {
+    thinkSpinner.stop();
+    warn(err.message);
+    return [];
+  });
+
+  thinkSpinner.stop();
+
+  for (const msg of responses) {
+    const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    agentSays(clean);
+
+    // patches
+    const patches = await proposeAndApply(clean, projectPath, { confirmEach: true })
+      .catch(() => [] as PatchResult[]);
+    const applied = patches.filter(p => p.applied);
+
+    if (applied.length > 0) {
+      await agenticTurn(
+        `Applied ${applied.length} change(s):\n${applied.map(p => `- ${p.op} ${p.path}`).join("\n")}\nVerify the changes are correct and continue.`,
+        projectPath,
+        depth + 1,
+        alreadyRan
+      );
+      return;
+    }
+
+    // commands
+    const pending = extractPendingCommands(clean, alreadyRan);
+    for (const cmd of pending) {
+      alreadyRan.add(cmd.command);
+      agentWantsToRun(cmd.command, cmd.reason);
+      const approved = await confirm("run this command?");
+
+      if (!approved) {
+        await agenticTurn(
+          `User declined: \`${cmd.command}\`. Propose alternative or explain manual steps.`,
+          projectPath,
+          depth + 1,
+          alreadyRan
+        );
+        continue;
+      }
+
+      const runSpinner = spin(`running: ${cmd.command}`);
+      const result = await runCommand(cmd.command, projectPath);
+      runSpinner.stop();
+      printCommandResult(result);
+
+      await agenticTurn(
+        formatResultForAgent(result),
+        projectPath,
+        depth + 1,
+        alreadyRan
+      );
+    }
+  }
+}
+```
+
+## Problem 3: JSON patch search/replace fails
+
+In `cli/lib/patcher.ts`, add JSON-aware patching:
+
+```typescript
+// at top of applyPatch(), before generic edit logic:
+if (op.op === "edit" && op.path.endsWith(".json")) {
+  return applyJsonPatch(op, projectRoot);
+}
+
+async function applyJsonPatch(
+  op: Extract<PatchOperation, { op: "edit" }>,
+  projectRoot: string
+): Promise<PatchResult> {
+  const absPath = path.join(projectRoot, op.path);
+  
+  try {
+    const raw = await fs.readFile(absPath, "utf-8");
+    const current = JSON.parse(raw);
+    
+    // parse the replace block as JSON fragment and deep merge
+    // agent outputs full JSON object in replace — parse and merge at top level
+    let replacement: Record<string, any>;
+    try {
+      replacement = JSON.parse(op.replace);
+    } catch {
+      // replace block isn't valid JSON — fall back to string search
+      return applyStringPatch(op, projectRoot);
+    }
+
+    const merged = deepMerge(current, replacement);
+    const newContent = JSON.stringify(merged, null, 2) + "\n";
+    
+    // generate diff
+    const diff = generateJsonDiff(current, merged);
+    
+    await atomicWrite(absPath, newContent);
+    
+    return {
+      op: "edit",
+      path: op.path,
+      applied: true,
+      diff,
+    };
+  } catch (err: any) {
+    return {
+      op: "edit",
+      path: op.path,
+      applied: false,
+      diff: "",
+      error: err.message,
+    };
+  }
+}
+
+function deepMerge(base: any, override: any): any {
+  if (typeof base !== "object" || typeof override !== "object") return override;
+  const result = { ...base };
+  for (const key of Object.keys(override)) {
+    if (
+      key in base &&
+      typeof base[key] === "object" &&
+      typeof override[key] === "object" &&
+      !Array.isArray(base[key])
+    ) {
+      result[key] = deepMerge(base[key], override[key]);
+    } else {
+      result[key] = override[key];
+    }
+  }
+  return result;
+}
+
+function generateJsonDiff(before: any, after: any): string {
+  const beforeStr = JSON.stringify(before, null, 2).split("\n");
+  const afterStr  = JSON.stringify(after, null, 2).split("\n");
+  const lines: string[] = [];
+
+  const maxLen = Math.max(beforeStr.length, afterStr.length);
+  for (let i = 0; i < maxLen; i++) {
+    const b = beforeStr[i];
+    const a = afterStr[i];
+    if (b === a) {
+      lines.push(`  ${a ?? ""}`);
+    } else {
+      if (b !== undefined) lines.push(`- ${b}`);
+      if (a !== undefined) lines.push(`+ ${a}`);
+    }
+  }
+  return lines.join("\n");
+}
+```
+
+## Expected flow after fix
 
 ```
-  your stack
-  ────────────────────────────────────────
-  project      my-api
-  framework    hono
-  database     postgres
-  db host      neon
-  orm          prisma
-  auth         better-auth
-  pkg manager  bun
+? you › analyse the project dir and give me a summary
 
-  ? scaffold this project? (y/n) › y
+  ⠋ reading project files...
+  ⠋ thinking...
 
-  ⠋ fetching latest docs...
-  ℹ fetched docs for: hono, prisma
+  fixd › TypeScript CLI tool — terminal-native dev environment agent.
+         Three commands: doctor (diagnose/fix), init (scaffold), deploy (Nosana).
+         Stack: Bun + TypeScript + Groq LLM + Context7 docs.
+         Core modules: scanner, diagnostics, patcher, executor, memory.
+         6 open TS2591 errors — @types/node missing from tsconfig types field.
 
-  scaffolding
-  ────────────────────────────────────────
-  ⠋ generating... (6 files so far)
+? you › fix the typescript errors
 
-  writing files
-  ────────────────────────────────────────
-  ✔ created: package.json
-  ✔ created: tsconfig.json
-  ✔ created: .env
-  ✔ created: .env.example
-  ✔ created: .gitignore
-  ✔ created: src/index.ts
-  ✔ created: prisma/schema.prisma
-  ✔ created: src/lib/auth.ts
-  ✔ created: README.md
+  ⠋ reading project files...
+  ⠋ thinking...
 
-  setup
-  ────────────────────────────────────────
-  ✔ git init
-  ✔ initial commit
-  ✔ dependencies installed
+  → edit: tsconfig.json
+    - "types": []
+    + "types": ["node"]
 
-  goodbye.
+  ? apply this change? (y/n) › y
+  ✔ applied: tsconfig.json
+
+  ⠋ agent analysing output...
+  fixd › tsconfig updated. Run bun tsc --noEmit to verify.
+
+  ╭─ agent wants to run
+  │  $ bun tsc --noEmit
+  ╰─
+  ? run this command? (y/n) › y
+  ✔ OK  0 errors
 ```
 
 ## Do not touch
 - `cli/lib/display.ts`
-- `cli/lib/diagnostics.ts`
-- `cli/lib/executor.ts`
+
+
 - `cli/lib/context7.ts`
 - `cli/lib/memory.ts`
-- `src/actions/`
+
 ```

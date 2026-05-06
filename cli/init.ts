@@ -7,6 +7,7 @@ import { disconnect } from "./lib/agent.js";
 import { proposeAndApply } from "./lib/patcher.js";
 import { fetchDocsForStack, formatDocsForPrompt } from "./lib/context7.js";
 import { runCommand } from "./lib/executor.js";
+import { runDoctor } from "./doctor.js";
 
 import {
     printHeader,
@@ -256,7 +257,10 @@ full file content here
     }
 
     console.log();
-    closePrompt();
-    bye();
-    disconnect();
+
+    // ── Auto-run doctor on the new project ───────────────────────────────────
+    info(`running ${chalk.white("fixd doctor")} on your new project...`);
+    console.log();
+    process.chdir(projectDir);
+    await runDoctor();
 }

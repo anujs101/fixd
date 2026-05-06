@@ -2,6 +2,7 @@ import chalk from "chalk";
 import path from "node:path";
 import { sendMessage, disconnect } from "./lib/agent.js";
 import { proposeAndApply } from "./lib/patcher.js";
+import { readRelevantFiles } from "./lib/projectReader.js";
 import {
     loadMemory,
     saveMemory,
@@ -10,12 +11,14 @@ import {
     summarizeSession,
     type AppliedFix,
 } from "./lib/memory.js";
+import { fixTypescriptNodeTypes } from "../src/actions/fixEnv.js";
 import {
     detectLibrariesInProject,
     fetchDocsForQuery,
     formatDocsForPrompt,
     type LibraryDoc,
 } from "./lib/context7.js";
+
 
 import { scanProject } from "../src/actions/scanFiles.js";
 import { detectIssues, type DetectedIssue } from "../src/actions/fixEnv.js";
@@ -256,8 +259,23 @@ export async function runDoctor() {
     // ── Phase 2: detect issues locally ──────────────────────────────────────────
     const issues = detectIssues(scan, projectPath);
 
-    // Add real errors from diagnostics as HIGH issues
-    for (const e of diagErrors) {
+    // ── Promote TS2591 errors to a single auto-fixable issue ─────────────────
+    // TS2591 = "Cannot find name 'process'" — always fixed by adding @types/node
+    const ts2591Errors = diagErrors.filter((e) => e.code === "TS2591");
+    const otherDiagErrors = diagErrors.filter((e) => e.code !== "TS2591");
+
+    if (ts2591Errors.length > 0) {
+        issues.push({
+            severity: "HIGH",
+            type: "MISSING_NODE_TYPES",
+            description: `${ts2591Errors.length} TS2591 error(s) — @types/node not configured in tsconfig.json. Run: bun add -d @types/node`,
+            autoFixable: true,
+            fix: () => fixTypescriptNodeTypes(projectPath),
+        });
+    }
+
+    // Add remaining diagnostic errors (non-TS2591) as non-fixable issues
+    for (const e of otherDiagErrors) {
         const loc = e.file ? `${e.file}${e.line ? `:${e.line}` : ""}${e.col ? `:${e.col}` : ""}` : "";
         issues.push({
             severity: "HIGH",
@@ -508,22 +526,48 @@ async function agenticTurn(
         return;
     }
 
-    const thinkSpinner = spin(depth === 0 ? "thinking..." : "agent analysing output...");
+    // ── READ FILES before every top-level turn (depth 0 only) ────────────────
+    let fileContext = "";
+    if (depth === 0) {
+        const readSpinner = spin("reading project files...");
+        fileContext = await readRelevantFiles(userMessage, projectPath).catch(() => "");
+        readSpinner.stop();
+    }
 
-    // Append format rules to keep chat responses terse and structured
-    const CHAT_FORMAT = [
-        "",
-        "",
-        "RESPOND FORMAT:",
-        "- Max 4 lines unless showing code",
-        "- If showing code: use fenced blocks with language tag",
-        "- No thinking out loud",
-        '- No "I will", "Let me", "Sure" openers',
-        "- Start answer directly",
-    ].join("\n");
+    // ── Pick format instructions based on intent ──────────────────────────────
+    const isFixRequest = /\b(fix|apply|implement|create|add|remove|update|change|patch|edit)\b/i.test(userMessage);
 
-    // Enrich with live docs if user is asking about a known library (depth 0 only)
-    let enrichedMessage = withCwd(userMessage + CHAT_FORMAT, projectPath);
+    const formatInstructions = isFixRequest
+        ? [
+            "",
+            "",
+            "EXECUTE DON'T EXPLAIN:",
+            "- If fixing a file: output patch markers immediately, no preamble",
+            "- If running a command: output bash block immediately",
+            "- Do not describe what you will do — just do it",
+            "- After patch markers: one sentence max explaining what changed",
+        ].join("\n")
+        : [
+            "",
+            "",
+            "RESPOND FORMAT:",
+            "- Answer directly from file contents above",
+            "- Max 4 lines unless showing code",
+            "- If showing code: use fenced blocks with language tag",
+            '- No "I will", "Let me", "Sure" openers',
+            "- Start answer immediately",
+        ].join("\n");
+
+    // ── Build enriched message (file context + docs + format rules) ───────────
+    const parts: string[] = [];
+    if (fileContext) parts.push(fileContext);
+    parts.push(`[Working directory: ${projectPath}]`);
+    parts.push("");
+    parts.push(userMessage + formatInstructions);
+
+    let enrichedMessage = parts.filter(Boolean).join("\n");
+
+    // Inject live library docs for depth-0 turns
     if (depth === 0) {
         const docs: LibraryDoc[] = await fetchDocsForQuery(userMessage, projectLibraries).catch(() => []);
         if (docs.length > 0) {
@@ -532,7 +576,9 @@ async function agenticTurn(
         }
     }
 
-    const responses = await sendMessage(enrichedMessage, "chat").catch((err: any) => {
+    const thinkSpinner = spin(depth === 0 ? "thinking..." : "agent analysing output...");
+
+    const responses = await sendMessage(enrichedMessage, isFixRequest ? "diagnose" : "chat").catch((err: any) => {
         thinkSpinner.stop();
         warn(err.message);
         return [];
@@ -552,7 +598,7 @@ async function agenticTurn(
         if (applied.length > 0) {
             // Feed applied changes back so the agent has accurate context
             await agenticTurn(
-                `Applied ${applied.length} file change(s):\n${applied.map((p) => `- ${p.op} ${p.path}`).join("\n")}\n\nContinue.`,
+                `Applied ${applied.length} file change(s):\n${applied.map((p) => `- ${p.op} ${p.path}`).join("\n")}\n\nVerify the changes are correct and continue.`,
                 projectPath,
                 depth + 1,
                 alreadyRan,
@@ -573,7 +619,7 @@ async function agenticTurn(
 
             if (!approved) {
                 await agenticTurn(
-                    `[User declined to run: \`${cmd.command}\`]. Suggest an alternative or explain what to do manually.`,
+                    `[User declined to run: \`${cmd.command}\`]. Propose alternative or explain manual steps.`,
                     projectPath,
                     depth + 1,
                     alreadyRan,

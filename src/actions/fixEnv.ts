@@ -169,6 +169,82 @@ export async function fixPortConflict(port: number): Promise<FixResult> {
   };
 }
 
+// ─── Fixer 5: add @types/node to tsconfig + install package ─────────────────────
+//
+// Fixes TS2591 "Cannot find name 'process'" / "node:fs" errors.
+// 1. Adds "node" to tsconfig.json compilerOptions.types
+// 2. Adds @types/node to package.json devDependencies (deferred install via npm/bun)
+
+export async function fixTypescriptNodeTypes(
+  projectPath: string
+): Promise<FixResult> {
+  const filesChanged: string[] = [];
+  const diffs: string[] = [];
+
+  // 1. Patch tsconfig.json
+  const tsconfigPath = path.join(projectPath, "tsconfig.json");
+  try {
+    const raw = await fs.readFile(tsconfigPath, "utf-8");
+    const tsconfig = JSON.parse(raw) as Record<string, any>;
+    tsconfig.compilerOptions = tsconfig.compilerOptions ?? {};
+
+    const types: string[] = tsconfig.compilerOptions.types ?? [];
+    if (!types.includes("node")) {
+      tsconfig.compilerOptions.types = [...types, "node"];
+      await atomicWrite(tsconfigPath, JSON.stringify(tsconfig, null, 2) + "\n");
+      filesChanged.push("tsconfig.json");
+      diffs.push(simpleDiff("tsconfig.json", [`"types": [${tsconfig.compilerOptions.types.map((t: string) => `"${t}"`).join(", ")}]`]));
+    }
+  } catch {
+    return { applied: false, description: "tsconfig.json not found or not valid JSON", diff: "", filesChanged: [] };
+  }
+
+  // 2. Check if @types/node is already installed
+  const typesNodePath = path.join(projectPath, "node_modules", "@types", "node");
+  let alreadyInstalled = false;
+  try {
+    await fs.stat(typesNodePath);
+    alreadyInstalled = true;
+  } catch { /* not installed */ }
+
+  if (!alreadyInstalled) {
+    // Detect package manager
+    let installCmd = "npm install --save-dev @types/node";
+    try {
+      await fs.stat(path.join(projectPath, "bun.lock"));
+      installCmd = "bun add -d @types/node";
+    } catch { /* not bun */ }
+    try {
+      await fs.stat(path.join(projectPath, "pnpm-lock.yaml"));
+      installCmd = "pnpm add -D @types/node";
+    } catch { /* not pnpm */ }
+    try {
+      await fs.stat(path.join(projectPath, "yarn.lock"));
+      installCmd = "yarn add -D @types/node";
+    } catch { /* not yarn */ }
+
+    // Run the install synchronously as part of the fix
+    const { exec } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execAsync = promisify(exec);
+    try {
+      await execAsync(installCmd, { cwd: projectPath, timeout: 60_000 });
+      filesChanged.push("package.json", "node_modules/@types/node");
+      diffs.push(simpleDiff("devDependencies", [`"@types/node": "latest"`]));
+    } catch (installErr: any) {
+      // tsconfig was patched, warn about manual install
+      diffs.push(simpleDiff("ACTION REQUIRED", [`Run: ${installCmd}`]));
+    }
+  }
+
+  return {
+    applied: filesChanged.length > 0,
+    description: `Added "node" to tsconfig types${alreadyInstalled ? "" : " and installed @types/node"}`,
+    diff: diffs.join("\n\n"),
+    filesChanged,
+  };
+}
+
 // ─── Issue detection (CLI-side, no LLM needed) ───────────────────────────────
 
 export interface DetectedIssue {
@@ -276,3 +352,4 @@ export function detectIssues(scan: ProjectScan, projectPath: string): DetectedIs
 
   return issues;
 }
+
