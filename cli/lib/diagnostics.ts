@@ -321,11 +321,8 @@ function detectApplicableCheckers(projectPath: string): StackChecker[] {
             } catch { continue; }
         }
 
-        // Skip JavaScript ESLint if TypeScript is already being checked
-        if (checker.stack === "JavaScript (ESLint)") {
-            const hasTsc = applicable.some((c) => c.stack === "TypeScript");
-            if (hasTsc) continue;  // tsc already covers TS/JS projects
-        }
+        // Note: ESLint and TypeScript both run — they check complementary things.
+        // tsc = type correctness, ESLint = code quality / style rules (fix 7.2)
 
         applicable.push(checker);
     }
@@ -356,7 +353,9 @@ export async function runDiagnostics(projectPath: string): Promise<CheckerResult
     await Promise.all(
         checkers.map(async (checker) => {
             const start = Date.now();
-            const timeout = checker.timeout ?? 60_000;
+            // B5: respect the same FIXD_COMMAND_TIMEOUT env var used by executor.ts
+            const envTimeout = parseInt(process.env.FIXD_COMMAND_TIMEOUT ?? "120000", 10);
+            const timeout = checker.timeout ?? envTimeout;
             const allCommands = [checker.command, ...(checker.fallbacks ?? [])];
             let lastResult = { stdout: "", stderr: "command not found", exitCode: 127 };
 

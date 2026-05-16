@@ -3,13 +3,18 @@ import { config as dotenvConfig } from "dotenv";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-// Load .env from the fixd package root (cli/../.env),
-// NOT from process.cwd() which changes depending on where the user runs fixd.
+// Load API keys in priority order (fix 5.1):
+// 1. ~/.config/fixd/.env  — XDG user config (recommended, keeps keys out of repo)
+// 2. ~/.fixd/.env         — legacy fallback for non-XDG systems
+// 3. <pkg>/../.env        — package-local .env (last resort, dev convenience only)
+import os from "node:os";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenvConfig({ path: path.resolve(__dirname, "../.env") });
-dotenvConfig({ path: path.resolve(__dirname, "../.env.local"), override: false }); // allow local overrides
+dotenvConfig({ path: path.join(os.homedir(), ".config", "fixd", ".env") });
+dotenvConfig({ path: path.join(os.homedir(), ".fixd", ".env"),   override: false });
+dotenvConfig({ path: path.resolve(__dirname, "../.env"),           override: false });
+dotenvConfig({ path: path.resolve(__dirname, "../.env.local"),     override: false });
 import chalk from "chalk";
-import { checkHealth } from "./lib/agent.js";
+import { checkHealth, checkOpenRouterHealth } from "./lib/agent.js";
 import {
     printHeader,
     error,
@@ -19,39 +24,59 @@ import {
 } from "./lib/display.js";
 import { SMALL_MODEL, LARGE_MODEL } from "./lib/llm.js";
 
-const VERSION = "0.1.0";
+const VERSION = "0.3.0"; // keep in sync with package.json
 
 // ─── Help text ────────────────────────────────────────────────────────────────
 
 function printHelp() {
     console.log();
     console.log(`  ${chalk.bold.white("fixd")} ${chalk.dim(`v${VERSION}`)}`);
-    console.log(`  ${chalk.dim("dev environment agent · powered by groq + nosana")}`);
+    console.log(`  ${chalk.dim("dev environment agent · powered by openrouter + groq")}`);
     console.log();
     console.log(`  ${chalk.bold("Usage:")}`);
     console.log(
-        `    ${chalk.cyan("fixd doctor")}   ${chalk.dim("diagnose + fix your broken project")}`
+        `    ${chalk.cyan("fixd doctor")}          ${chalk.dim("diagnose + fix your broken project")}`
     );
     console.log(
-        `    ${chalk.cyan("fixd init")}     ${chalk.dim("scaffold a new project from scratch")}`
+        `    ${chalk.cyan("fixd doctor --fast")}   ${chalk.dim("single-agent mode (faster, no parallel sub-agents)")}`
     );
     console.log(
-        `    ${chalk.cyan("fixd deploy")}   ${chalk.dim("containerize + ship to nosana GPU")}`
+        `    ${chalk.cyan("fixd init")}            ${chalk.dim("scaffold a new project from scratch")}`
     );
     console.log(
-        `    ${chalk.cyan("fixd status")}   ${chalk.dim("check groq API connectivity")}`
+        `    ${chalk.cyan("fixd init --yes")}      ${chalk.dim("scaffold with all defaults (hono + neon + prisma + bun)")}`
+    );
+    console.log(
+        `    ${chalk.cyan("fixd deploy")}          ${chalk.dim("containerize + ship to nosana GPU")}`
+    );
+    console.log(
+        `    ${chalk.cyan("fixd undo")}            ${chalk.dim("restore files from the last patch session")}`
+    );
+    console.log(
+        `    ${chalk.cyan("fixd status")}          ${chalk.dim("check API connectivity")}`
     );
     console.log();
     console.log(`  ${chalk.bold("Options:")}`);
     console.log(
-        `    ${chalk.cyan("--help, -h")}    ${chalk.dim("show this help message")}`
+        `    ${chalk.cyan("--help, -h")}           ${chalk.dim("show this help message")}`
     );
     console.log(
-        `    ${chalk.cyan("--version, -v")} ${chalk.dim("show version")}`
+        `    ${chalk.cyan("--version, -v")}        ${chalk.dim("show version")}`
+    );
+    console.log(
+        `    ${chalk.cyan("--fast")}               ${chalk.dim("skip parallel sub-agents (doctor only)")}`
+    );
+    console.log();
+    console.log(`  ${chalk.bold("Env vars:")}`);
+    console.log(
+        `    ${chalk.cyan("FIXD_AUTO_RUN_LEVEL")}  ${chalk.dim("conservative | moderate (default) | aggressive")}`
+    );
+    console.log(
+        `    ${chalk.cyan("FIXD_EXPLORE_MODEL")}   ${chalk.dim("small (default) | large — model for classifier/explore")}`
     );
     console.log();
     console.log(
-        `  ${chalk.dim("Requires: ")}${chalk.white("GROQ_API_KEY")} ${chalk.dim("in your .env")}`
+        `  ${chalk.dim("Requires: ")}${chalk.white("OPENROUTER_API_KEY")} + ${chalk.white("GROQ_API_KEY")} ${chalk.dim("in ~/.config/fixd/.env")}`
     );
     console.log();
 }
@@ -60,22 +85,34 @@ function printHelp() {
 
 async function runStatus() {
     printHeader("status");
-    const s = spin("checking groq API...");
 
-    const healthy = await checkHealth();
-    s.stop();
-
-    if (!healthy) {
-        error("Groq API is not reachable.");
-        info("Make sure GROQ_API_KEY is set in your .env file.");
-        info("Get a key at: https://console.groq.com/keys");
-        process.exit(1);
+    // Small model — Groq
+    const s1 = spin("checking Groq API...");
+    const groqOk = await checkHealth();
+    s1.stop();
+    if (groqOk) {
+        console.log(`  ${chalk.green("✔")} Groq API reachable`);
+    } else {
+        console.log(`  ${chalk.red("✖")} Groq API unreachable — check GROQ_API_KEY`);
     }
 
-    console.log(`  ${chalk.green("✔")} Groq API reachable`);
+    // Large model — OpenRouter (fix 10.2)
+    const s2 = spin("checking OpenRouter API...");
+    const orStatus = await checkOpenRouterHealth();
+    s2.stop();
+    if (orStatus === "ok") {
+        console.log(`  ${chalk.green("✔")} OpenRouter API reachable`);
+    } else if (orStatus === "no_key") {
+        console.log(`  ${chalk.yellow("⚠")} OpenRouter: OPENROUTER_API_KEY not set`);
+    } else {
+        console.log(`  ${chalk.red("✖")} OpenRouter API unreachable — check OPENROUTER_API_KEY`);
+    }
+
+    console.log();
     info(`small model : ${SMALL_MODEL}`);
     info(`large model : ${LARGE_MODEL}`);
     info(`project     : ${process.cwd()}`);
+    info(`config dir  : ${path.join(os.homedir(), ".config", "fixd")}`);
     console.log();
 }
 
@@ -107,19 +144,33 @@ async function preflight(): Promise<boolean> {
         return false;
     }
 
+    // R1: warn (don't block) if OPENROUTER_API_KEY is missing — large-model calls
+    // will fall through to Clarifai, so the CLI is still usable.
+    if (!process.env.OPENROUTER_API_KEY) {
+        const { warn: displayWarn } = await import("./lib/display.js");
+        displayWarn("OPENROUTER_API_KEY not set — large-model calls will fall back to Clarifai");
+    }
+
     return true;
 }
 
 // ─── Lazy load commands ───────────────────────────────────────────────────────
 
-async function runDoctor() {
-    const { runDoctor } = await import("./doctor.js");
-    await runDoctor();
+// L136: renamed from runUndo — the old name caused the imported { runUndo } to
+// shadow the outer function, which is a TS/lint error and confusing to read.
+async function launchUndo() {
+    const { runUndo } = await import("./undo.js");
+    await runUndo();
 }
 
-async function runInit() {
-    const { runInit } = await import("./init.js");
-    await runInit();
+async function runDoctor(fast = false) {
+    const { runDoctor: _runDoctor } = await import("./doctor.js");
+    await _runDoctor(undefined, fast);
+}
+
+async function runInit(useDefaults = false) {
+    const { runInit: _runInit } = await import("./init.js");
+    await _runInit(useDefaults);
 }
 
 async function runDeploy() {
@@ -147,17 +198,21 @@ async function main() {
     switch (command) {
         case "doctor": {
             if (!(await preflight())) break;
-            await runDoctor();
+            await runDoctor(flags.includes("--fast"));
             break;
         }
         case "init": {
             if (!(await preflight())) break;
-            await runInit();
+            await runInit(flags.includes("--yes") || flags.includes("-y"));
             break;
         }
         case "deploy": {
             if (!(await preflight())) break;
             await runDeploy();
+            break;
+        }
+        case "undo": {
+            await launchUndo();
             break;
         }
         case "status": {

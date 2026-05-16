@@ -34,8 +34,7 @@ const CLARIFAI_LARGE_MODEL =
     process.env.CLARIFAI_LARGE_MODEL ?? CLARIFAI_DEFAULT_LARGE_MODEL;
 
 // Exported alias — refers to the primary large model
-const LARGE_MODEL      = OPENROUTER_LARGE_MODEL;
-const GROQ_LARGE_MODEL = OPENROUTER_LARGE_MODEL; // kept for backward-compat exports
+const LARGE_MODEL = OPENROUTER_LARGE_MODEL;
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -53,8 +52,11 @@ export interface Message {
 const CODE_INTENT_RE =
     /\b(generat|scaffold|creat|write|build|implement|code|file|class|function|component)\b/i;
 
+// Analysis intent — technical terms that warrant the large model.
+// Intentionally excludes casual words (what, how, why, understand) to avoid
+// routing simple questions to the expensive large model (fix 2.3).
 const ANALYSIS_INTENT_RE =
-    /\b(analys|analyze|summary|overview|explain|review|understand|what|how|why|fix|debug|issue|error|problem)\b/i;
+    /\b(analys|analyze|summary|overview|review|fix|debug|refactor|diagnos|issue|error|problem|implement|migrat)\b/i;
 
 function pickModel(task: Task, prompt?: string): "small" | "large" {
     switch (task) {
@@ -323,7 +325,12 @@ export async function ask(
     }
 
     const data = (await res.json()) as any;
-    return stripThink(data.choices?.[0]?.message?.content ?? "");
+    const choice = data.choices?.[0];
+    // A1: warn when the model was cut off mid-response (finish_reason "length" = token limit)
+    if (choice?.finish_reason === "length") {
+        warn("⚠ agent response was truncated (token limit hit) — output may be incomplete");
+    }
+    return stripThink(choice?.message?.content ?? "");
 }
 
 /**
@@ -340,7 +347,10 @@ export async function* askStream(
     messages.push({ role: "user", content: prompt });
 
     const modelSize = pickModel(task, prompt);
-    const res = await llmFetch(modelSize, messages, true);
+    // B2: large-model streaming uses llmFetchWithFallback (OpenRouter → Clarifai)
+    const res = modelSize === "large"
+        ? await llmFetchWithFallback(messages, true)
+        : await llmFetch("small", messages, true);
 
     if (!res.body) throw new Error("No response body for streaming request");
 
@@ -387,13 +397,17 @@ export async function chat(messages: Message[], task: Task): Promise<string> {
     }
 
     const data = (await res.json()) as any;
-    return stripThink(data.choices?.[0]?.message?.content ?? "");
+    const choice = data.choices?.[0];
+    // A1: warn when the model was cut off mid-response (finish_reason "length" = token limit)
+    if (choice?.finish_reason === "length") {
+        warn("⚠ agent response was truncated (token limit hit) — output may be incomplete");
+    }
+    return stripThink(choice?.message?.content ?? "");
 }
 
 // ─── Exports for model info ───────────────────────────────────────────────────
 
-export { SMALL_MODEL, LARGE_MODEL, GROQ_LARGE_MODEL, CLARIFAI_LARGE_MODEL };
-export type { LLMService };
+export { SMALL_MODEL, LARGE_MODEL };
 
 // Dummy type kept for backward compat (no longer used for routing)
-type LLMService = "openrouter" | "clarifai" | "groq";
+export type LLMService = "openrouter" | "clarifai" | "groq";

@@ -47,7 +47,7 @@ export interface AppliedFix {
 /** Loose scan shape — avoids importing scanFiles.js */
 interface ScanLike {
     detectedPackageManager?: string;
-    nodeVersion?: string;
+    nodeVersion?: string | null;
     packageJson?: {
         dependencies?: Record<string, string>;
         devDependencies?: Record<string, string>;
@@ -115,12 +115,20 @@ export async function saveMemory(memory: ProjectMemory): Promise<void> {
     try {
         const dir = path.join(memory.projectRoot, MEMORY_DIR);
         await fs.mkdir(dir, { recursive: true });
+
+        // S2: Auto-gitignore .fixd/ so memory.json is never accidentally committed
+        const gitignorePath = path.join(dir, ".gitignore");
+        try {
+            await fs.writeFile(gitignorePath, "*\n", { flag: "wx" }); // wx = only create, never overwrite
+        } catch { /* already exists */ }
+
         const fp  = memoryFilePath(memory.projectRoot);
         const tmp = `${fp}.tmp`;
         await fs.writeFile(tmp, JSON.stringify(memory, null, 2), "utf-8");
         await fs.rename(tmp, fp);
-    } catch {
-        // Never throw
+    } catch (err: any) {
+        // B4: non-fatal but visible — user should know if history won’t persist
+        console.error(`\n  ⚠ fixd: could not save session memory — ${(err as Error).message ?? "disk error"}`);
     }
 }
 
@@ -164,8 +172,13 @@ export function recordFix(memory: ProjectMemory, fixes: AppliedFix[]): ProjectMe
     return { ...memory, fixedIssues };
 }
 
-/** Ask LLM for a 2-sentence session summary and append to chatSummaries. */
-export async function summarizeSession(memory: ProjectMemory, sessionLog: string): Promise<ProjectMemory> {
+/** Ask LLM for a 2-sentence session summary and append to chatSummaries.
+ *  changedFiles — list of relative file paths patched during the session (fix 8.1). */
+export async function summarizeSession(
+    memory: ProjectMemory,
+    sessionLog: string,
+    changedFiles: string[] = []
+): Promise<ProjectMemory> {
     if (!sessionLog.trim()) return memory;
 
     try {
@@ -177,7 +190,7 @@ export async function summarizeSession(memory: ProjectMemory, sessionLog: string
         const entry: ChatSummary = {
             sessionDate:  new Date().toISOString(),
             summary:      summary.trim().slice(0, 500),
-            filesChanged: [],
+            filesChanged: [...new Set(changedFiles)], // deduplicated
         };
 
         const chatSummaries = [...memory.chatSummaries, entry].slice(-MAX_CHAT_SUMMARIES);

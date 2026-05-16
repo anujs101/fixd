@@ -8,18 +8,19 @@ export interface CommandResult {
     command: string;
 }
 
-const BLOCKED_COMMANDS = [
-    "rm -rf /",
-    "dd if=",
-    "mkfs",
-    ":(){ :|:& };:",
-    "> /dev/sda",
-    "chmod -R 777 /",
+// S1: A command blocklist is NOT a security boundary — it's trivially bypassable
+// (double spaces, eval wrapping, character variation, etc.).
+// Real protection is the human-in-the-loop confirm() gate in doctor.ts:
+// the user reads and approves every command before it runs.
+// This function is kept as a last-resort sanity check for the most catastrophic
+// accidental invocations only (e.g. a test that somehow generates fork bombs).
+const CATASTROPHIC_PATTERNS = [
+    /:\(\)\s*\{\s*:\s*\|\s*:&\s*\}/, // fork bomb
+    />\s*\/dev\/(sda|hda|nvme)/,      // raw disk overwrite
 ];
 
 function isSafeCommand(command: string): boolean {
-    const lower = command.toLowerCase().trim();
-    return !BLOCKED_COMMANDS.some((blocked) => lower.includes(blocked));
+    return !CATASTROPHIC_PATTERNS.some((re) => re.test(command));
 }
 
 /**

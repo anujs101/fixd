@@ -17,7 +17,7 @@
 ##  Demo
 
 <div align="center">
-  <img src="./ss.jpg" alt="fixd in action" width="100%" />
+  <img src="./ss.jpeg" alt="fixd in action" width="100%" />
 </div>
 
 ```

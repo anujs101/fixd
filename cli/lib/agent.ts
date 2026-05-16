@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { chat, ask, type Message, type Task } from "./llm.js";
-import { loadMemory, formatMemoryForPrompt } from "./memory.js";
+import { loadMemory, formatMemoryForPrompt, type ProjectMemory } from "./memory.js";
 
 // ─── System prompt — built from characters/agent.character.json ───────────────
 
@@ -78,12 +78,42 @@ function loadSystemPrompt(): string {
     }
 }
 
-// ─── Session state ────────────────────────────────────────────────────────────
+// ─── Session state ───────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = loadSystemPrompt();
-const MAX_HISTORY = 20; // sliding window (user + assistant messages, not counting system)
+// B3: Active project path — set by runDoctor/runInit so sendMessage reads the
+// correct project's memory regardless of process.cwd().
+let activeProjectPath: string | null = null;
+
+// A4: In-session memory cache — avoids a disk read on every agenticTurn recursion.
+let _memoryCache: { projectPath: string; memory: ProjectMemory } | null = null;
+
+/** Call at the start of runDoctor/runInit to anchor memory reads to the correct project. */
+export function setActiveProject(projectPath: string): void {
+    activeProjectPath = projectPath;
+    _memoryCache = null; // invalidate on project switch
+}
 
 let history: Message[] = [];
+
+const SYSTEM_PROMPT = loadSystemPrompt();
+
+// History cap: token-estimated (1 token ≈ 4 chars), not just message count
+// At 60k tokens we stay well within GPT-4-class context windows.
+const MAX_HISTORY_CHARS = 60_000 * 4; // 60k tokens × 4 chars/token
+
+/** Trim history from the oldest end to stay within the token budget. */
+function trimHistoryByTokens(msgs: Message[]): Message[] {
+    let total = 0;
+    const result: Message[] = [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+        const len = msgs[i].content.length;
+        if (total + len > MAX_HISTORY_CHARS) break;
+        result.unshift(msgs[i]);
+        total += len;
+    }
+    return result;
+}
+
 
 // ─── AgentResponse — same interface as the old client.ts ─────────────────────
 
@@ -103,15 +133,22 @@ export async function sendMessage(
 ): Promise<AgentResponse[]> {
     history.push({ role: "user", content: text });
 
-    // Inject persistent project memory into the system prompt
-    const memory = await loadMemory(process.cwd());
+    // B3/A4: use the correct project path (set by setActiveProject) and cache the memory
+    const projPath = activeProjectPath ?? process.cwd();
+    let memory: ProjectMemory;
+    if (_memoryCache?.projectPath === projPath) {
+        memory = _memoryCache.memory;
+    } else {
+        memory = await loadMemory(projPath);
+        _memoryCache = { projectPath: projPath, memory };
+    }
     const memoryContext = formatMemoryForPrompt(memory);
     const fullSystemPrompt = memoryContext
         ? `${memoryContext}\n\n${SYSTEM_PROMPT}`
         : SYSTEM_PROMPT;
 
-    // Build full message array: system + history (capped at MAX_HISTORY)
-    const trimmed = history.slice(-MAX_HISTORY);
+    // Build full message array: system + history (capped by token budget)
+    const trimmed = trimHistoryByTokens(history);
     const messages: Message[] = [
         { role: "system", content: fullSystemPrompt },
         ...trimmed,
@@ -128,6 +165,7 @@ export async function sendMessage(
 
 export function resetSession(): void {
     history = [];
+    _memoryCache = null; // also clear memory cache when session resets
 }
 
 // ─── checkHealth — verify GROQ_API_KEY + reachability ────────────────────────
@@ -141,6 +179,22 @@ export async function checkHealth(): Promise<boolean> {
         return true;
     } catch {
         return false;
+    }
+}
+
+// ─── checkOpenRouterHealth — verify OPENROUTER_API_KEY reachability ───────────
+
+export async function checkOpenRouterHealth(): Promise<"ok" | "no_key" | "unreachable"> {
+    const key = process.env.OPENROUTER_API_KEY;
+    if (!key) return "no_key";
+    try {
+        const res = await fetch("https://openrouter.ai/api/v1/models", {
+            headers: { Authorization: `Bearer ${key}` },
+            signal: AbortSignal.timeout(8_000),
+        });
+        return res.ok ? "ok" : "unreachable";
+    } catch {
+        return "unreachable";
     }
 }
 

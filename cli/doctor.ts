@@ -1,7 +1,7 @@
 import chalk from "chalk";
 import path from "node:path";
-import { sendMessage, disconnect } from "./lib/agent.js";
-import { proposeAndApply } from "./lib/patcher.js";
+import { sendMessage, disconnect, setActiveProject } from "./lib/agent.js";
+import { proposeAndApply, resetBackupSession } from "./lib/patcher.js";
 import { readRelevantFiles } from "./lib/projectReader.js";
 import {
     loadMemory,
@@ -18,6 +18,8 @@ import {
     formatDocsForPrompt,
     type LibraryDoc,
 } from "./lib/context7.js";
+import { exploreProject, diagnoseWithAgent } from "./lib/sub-agents.js";
+import { classifyCommand } from "./lib/command-classifier.js";
 
 
 import { scanProject } from "../src/actions/scanFiles.js";
@@ -215,8 +217,16 @@ function renderDiagnosisResponse(raw: string, knownTypes: Set<string> = new Set(
 
 // ─── Main doctor flow ─────────────────────────────────────────────────────────
 
-export async function runDoctor() {
-    const projectPath = process.cwd();
+export async function runDoctor(cwd?: string, fast = false) {
+    // Default to cwd; init.ts passes the new project dir explicitly
+    // so we never need process.chdir() (which is a global side-effect)
+    const projectPath = cwd ?? process.cwd();
+
+    // Each command invocation gets a fresh backup session
+    resetBackupSession();
+
+    // B3: anchor the agent's memory reads to the correct project directory
+    setActiveProject(projectPath);
 
     printHeader("doctor");
     info(`scanning project at ${chalk.white(projectPath)}`);
@@ -225,6 +235,7 @@ export async function runDoctor() {
     // Load persistent memory for this project
     let currentMemory = await loadMemory(projectPath);
     const sessionLog: string[] = [];
+    const sessionChangedFiles: string[] = [];
 
     // ── Phase 1: local scan + real diagnostics (deterministic, no LLM) ───────────
     const scanSpinner = spin("scanning project files...");
@@ -295,66 +306,100 @@ export async function runDoctor() {
     section("issues found");
     printDetectedIssues(issues);
 
-    // ── Phase 3: agent explains with REAL scan data ─────────────────────────────
+    // ── Phase 3: parallel sub-agents analyse with REAL scan data ────────────────
     const scanContext = buildScanContext(projectPath, scan, diagContext);
     const issueList = issues.length > 0
         ? issues.map((i) => `- [${i.severity}] ${i.type}: ${i.description}`).join("\n")
         : "No issues detected.";
 
-    const diagSpinner = spin("agent analysing...");
+    const diagSpinner = spin(fast ? "agent analysing..." : "running parallel analysis...");
 
-    // Structured prompt — forces exact output format, prevents hallucination
-    const diagPrompt = [
-        `You are fixd. Respond ONLY in the exact format below. No prose. No thinking out loud.`,
-        ``,
-        `SCAN DATA:`,
-        "```",
-        scanContext,
-        "```",
-        ``,
-        `DETECTED ISSUES (${issues.length} total):`,
-        issueList,
-        ``,
-        `OUTPUT FORMAT — follow exactly, no deviations:`,
-        ``,
-        `ISSUES: {n} found`,
-        ``,
-        `---`,
-        `SEVERITY: HIGH | MEDIUM | LOW`,
-        `TYPE: {ISSUE_TYPE}`,
-        `PROBLEM: One sentence. What exactly is wrong.`,
-        `FIX: One sentence. Exact action to take.`,
-        `DIFF:`,
-        "\`\`\`diff",
-        `- old line`,
-        `+ new line`,
-        "\`\`\`",
-        `---`,
-        ``,
-        `(repeat block per issue)`,
-        ``,
-        `If no issues: respond with exactly "NO ISSUES FOUND"`,
-        ``,
-        `RULES:`,
-        `- No filler text before or after the blocks`,
-        `- No "I recommend", "Let me", "Okay", "First" or any conversational openers`,
-        `- Never suggest \`bun add\` or \`npm install\` for config fixes`,
-        `- For package.json fixes show JSON diff only, no install commands`,
-        `- If TYPESCRIPT CHECK says PASSED, TypeScript is FINE — do NOT mention tsconfig issues`,
-        `- Only mention issues that appear in the DETECTED ISSUES list above`,
-        `- Max 1 sentence per PROBLEM and FIX field`,
-    ].join("\n");
+    let diagResponseText: string;
 
-    const diagResponse = await sendMessage(diagPrompt, "diagnose").catch((err: any) => {
+    if (fast) {
+        // ── FAST MODE: single sequential LLM call (old behaviour) ────────────
+        const diagPrompt = [
+            `You are fixd. Respond ONLY in the exact format below. No prose. No thinking out loud.`,
+            ``,
+            `SCAN DATA:`,
+            "```",
+            scanContext,
+            "```",
+            ``,
+            `DETECTED ISSUES (${issues.length} total):`,
+            issueList,
+            ``,
+            `OUTPUT FORMAT — follow exactly, no deviations:`,
+            ``,
+            `ISSUES: {n} found`,
+            ``,
+            `---`,
+            `SEVERITY: HIGH | MEDIUM | LOW`,
+            `TYPE: {ISSUE_TYPE}`,
+            `PROBLEM: One sentence. What exactly is wrong.`,
+            `FIX: One sentence. Exact action to take.`,
+            `DIFF:`,
+            "\`\`\`diff",
+            `- old line`,
+            `+ new line`,
+            "\`\`\`",
+            `---`,
+            ``,
+            `(repeat block per issue)`,
+            ``,
+            `If no issues: respond with exactly "NO ISSUES FOUND"`,
+            ``,
+            `RULES:`,
+            `- No filler text before or after the blocks`,
+            `- No "I recommend", "Let me", "Okay", "First" or any conversational openers`,
+            `- Never suggest \`bun add\` or \`npm install\` for config fixes`,
+            `- For package.json fixes show JSON diff only, no install commands`,
+            `- If TYPESCRIPT CHECK says PASSED, TypeScript is FINE — do NOT mention tsconfig issues`,
+            `- Only mention issues that appear in the DETECTED ISSUES list above`,
+            `- Max 1 sentence per PROBLEM and FIX field`,
+        ].join("\n");
+
+        const diagResponse = await sendMessage(diagPrompt, "diagnose").catch((err: any) => {
+            diagSpinner.stop();
+            warn(err.message);
+            return [];
+        });
+
         diagSpinner.stop();
-        warn(err.message);
-        return [];
-    });
+        for (const msg of diagResponse) {
+            renderDiagnosisResponse(msg.text, knownTypes);
+        }
+    } else {
+        // ── PARALLEL MODE: explore + diagnose run concurrently ────────────────
+        const [exploreResult, rawDiagnosis] = await Promise.all([
+            exploreProject(projectPath).catch(() => null),
+            diagnoseWithAgent(scanContext, issueList).catch((err: any) => {
+                warn(`Diagnose sub-agent failed: ${err.message}`);
+                return "";
+            }),
+        ]);
 
-    diagSpinner.stop();
+        diagSpinner.stop();
 
-    for (const msg of diagResponse) {
-        renderDiagnosisResponse(msg.text, knownTypes);
+        if (exploreResult) {
+            // Surface any extra context the explorer found
+            const extras: string[] = [];
+            if (exploreResult.missingEnvVars?.length > 0) {
+                extras.push(`  ${chalk.dim("explorer noted missing env vars:")} ${exploreResult.missingEnvVars.join(", ")}`);
+            }
+            if (exploreResult.notes) {
+                extras.push(`  ${chalk.dim("explorer:")} ${exploreResult.notes}`);
+            }
+            if (extras.length > 0) {
+                console.log(chalk.dim("── explore ─────────────────────────"));
+                for (const e of extras) console.log(e);
+                console.log();
+            }
+        }
+
+        if (rawDiagnosis) {
+            renderDiagnosisResponse(rawDiagnosis, knownTypes);
+        }
     }
 
     // ── Phase 4: apply fixes locally (no agent, real fs writes) ──────────
@@ -484,8 +529,10 @@ export async function runDoctor() {
     // ── Phase 5: interactive chat with agentic execution loop ──────────────────────
     section("chat mode");
     info("ask anything about your project — fixd can run commands with your approval.");
+    if (!fast) info(chalk.dim("(tip: safe commands like git status, ls, tsc run automatically)"));
     info(`type ${chalk.white("exit")} or ${chalk.white("quit")} to leave.`);
     console.log();
+
 
     while (true) {
         const input = await prompt("you");
@@ -493,13 +540,12 @@ export async function runDoctor() {
         if (["exit", "quit", "q", ":q"].includes(input.toLowerCase())) break;
 
         sessionLog.push(`you: ${input}`);
-        await agenticTurn(input, projectPath, 0, new Set(), projectLibraries, sessionLog);
+        await agenticTurn(input, projectPath, 0, new Set(), projectLibraries, sessionLog, sessionChangedFiles);
     }
-
     closePrompt();
 
-    // Summarize and persist this session before exiting
-    const finalMemory = await summarizeSession(currentMemory, sessionLog.join("\n"));
+    // Summarize and persist this session before exiting (8.1: pass changedFiles)
+    const finalMemory = await summarizeSession(currentMemory, sessionLog.join("\n"), sessionChangedFiles);
     await saveMemory(finalMemory);
 
     bye();
@@ -518,10 +564,12 @@ async function agenticTurn(
     depth = 0,
     alreadyRan: Set<string> = new Set(),
     projectLibraries: string[] = [],
-    sessionLog: string[] = []
+    sessionLog: string[] = [],
+    sessionChangedFiles: string[] = []
 ): Promise<void> {
     const MAX_DEPTH = 6;
-    if (depth > MAX_DEPTH) {
+    // A3: was `depth > MAX_DEPTH` which allowed 7 turns — now correctly stops at 6
+    if (depth >= MAX_DEPTH) {
         info("(max tool calls reached for this turn)");
         return;
     }
@@ -596,6 +644,8 @@ async function agenticTurn(
         const patches = await proposeAndApply(clean, projectPath, { confirmEach: true });
         const applied = patches.filter((p) => p.applied);
         if (applied.length > 0) {
+            // Track changed files for session memory
+            for (const p of applied) sessionChangedFiles.push(p.path);
             // Feed applied changes back so the agent has accurate context
             await agenticTurn(
                 `Applied ${applied.length} file change(s):\n${applied.map((p) => `- ${p.op} ${p.path}`).join("\n")}\n\nVerify the changes are correct and continue.`,
@@ -603,17 +653,50 @@ async function agenticTurn(
                 depth + 1,
                 alreadyRan,
                 projectLibraries,
-                sessionLog
+                sessionLog,
+                sessionChangedFiles
             );
             return; // agent will continue the turn above
         }
 
         // ── Detect shell commands the agent wants to run ────────────────────────
-        const pending = extractPendingCommands(msg.text, alreadyRan);
+        // A5: Strip patch marker blocks first to prevent shell lines inside
+        // <<<WRITE: Makefile>>> from being double-extracted as pending commands.
+        const textWithoutPatches = clean
+            .replace(/<<<WRITE:.*?<<<END>>>/gs, "")
+            .replace(/<<<EDIT:.*?<<<END>>>/gs, "")
+            .replace(/<<<DELETE:[^\n>]+>>>/g, "")
+            .replace(/<<<RENAME:[^\n>]+>>>/g, "");
+        const pending = extractPendingCommands(textWithoutPatches, alreadyRan);
 
+        // ── Auto-run or confirm each pending command ──────────────────────────
         for (const cmd of pending) {
-            alreadyRan.add(cmd.command); // mark before approval so declined cmds are also deduped
-            agentWantsToRun(cmd.command, cmd.reason);
+            alreadyRan.add(cmd.command);
+
+            // Classify: fast path (no LLM) or LLM for ambiguous commands
+            const classifySpinner = depth === 0 ? spin("classifying command...") : null;
+            const classification = await classifyCommand(cmd.command).catch(() => ({ classification: "confirm" as const, reason: "llm-error" as const }));
+            classifySpinner?.stop();
+
+            if (classification.classification === "auto-run") {
+                // Auto-run silently — show a dim indicator but no prompt
+                console.log(`  ${chalk.dim("●")} ${chalk.dim("auto-running:")} ${chalk.white(cmd.command)}`);
+
+                const runSpinner = spin(`running: ${chalk.bold(cmd.command)}`);
+                const result = await runCommand(cmd.command, projectPath);
+                runSpinner.stop();
+
+                if (result.exitCode !== 0) {
+                    // Failed auto-run: show result and continue with agent
+                    printCommandResult(result);
+                }
+
+                await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles);
+                continue;
+            }
+
+            // confirm path — human approval
+            agentWantsToRun(cmd.command, cmd.reason, projectPath);
 
             const approved = await confirm(`run this command?`);
 
@@ -624,7 +707,8 @@ async function agenticTurn(
                     depth + 1,
                     alreadyRan,
                     projectLibraries,
-                    sessionLog
+                    sessionLog,
+                    sessionChangedFiles
                 );
                 continue;
             }
@@ -635,8 +719,7 @@ async function agenticTurn(
 
             printCommandResult(result);
 
-            // Feed output back to agent — the core of the agentic loop
-            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries, sessionLog);
+            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles);
         }
     }
 }

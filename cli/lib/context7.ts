@@ -5,6 +5,46 @@
 import { warn } from "./display.js";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
+
+// ─── Disk cache for Context7 docs (fix 3.3) ───────────────────────────────────
+// Avoids re-fetching the same docs on every cold start.
+// Cache file: ~/.config/fixd/context7-cache.json  (user-global, shared across projects)
+// TTL: 24 hours
+
+const CACHE_FILE = path.join(os.homedir(), ".config", "fixd", "context7-cache.json");
+const CACHE_TTL  = 24 * 60 * 60 * 1000; // 24 hours in ms
+
+interface CacheEntry {
+    content: string;
+    version: string | null;
+    tokens: number;
+    timestamp: number;
+}
+
+let _cache: Map<string, CacheEntry> | null = null;
+
+async function getCache(): Promise<Map<string, CacheEntry>> {
+    if (_cache) return _cache;
+    try {
+        const raw = await fs.readFile(CACHE_FILE, "utf-8");
+        const obj = JSON.parse(raw) as Record<string, CacheEntry>;
+        _cache = new Map(Object.entries(obj));
+    } catch {
+        _cache = new Map();
+    }
+    return _cache;
+}
+
+async function saveCache(cache: Map<string, CacheEntry>): Promise<void> {
+    try {
+        await fs.mkdir(path.dirname(CACHE_FILE), { recursive: true });
+        const obj = Object.fromEntries(cache);
+        await fs.writeFile(CACHE_FILE, JSON.stringify(obj, null, 2), "utf-8");
+    } catch {
+        // Non-fatal
+    }
+}
 
 const BASE_URL = "https://context7.com/api/v1";
 
@@ -113,6 +153,22 @@ export async function fetchDocs(
 ): Promise<LibraryDoc | null> {
     if (!process.env.CONTEXT7_API_KEY) return null;
 
+    // Q7: cache key excludes maxTokens — same doc at different limits reuses the cache
+    const cacheKey = `${libraryId}::${topic}`;
+
+    // ── Check disk cache first ────────────────────────────────────────────────
+    const cache = await getCache();
+    const cached = cache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return {
+            libraryId,
+            topic,
+            content: cached.content,
+            version: cached.version,
+            tokens: cached.tokens,
+        };
+    }
+
     try {
         const url = `${BASE_URL}${libraryId}?topic=${encodeURIComponent(topic)}&tokens=${maxTokens}`;
         const res = await fetch(url, { headers: c7Headers() });
@@ -128,18 +184,32 @@ export async function fetchDocs(
         try { data = JSON.parse(text); } catch { data = { content: text }; }
 
         const content: string = (data.content ?? data.text ?? text ?? "").trim()
-            // collapse runs of 3+ blank lines to 2
             .replace(/\n{3,}/g, "\n\n");
 
         if (!content) return null;
 
-        return {
+        const doc: LibraryDoc = {
             libraryId,
             topic,
             content,
             version: data.version ?? null,
             tokens: data.tokens ?? Math.ceil(content.length / 4),
         };
+
+        // Persist to disk cache
+        cache.set(cacheKey, {
+            content:   doc.content,
+            version:   doc.version,
+            tokens:    doc.tokens,
+            timestamp: Date.now(),
+        });
+        // Evict stale entries while we have the cache open
+        for (const [k, v] of cache) {
+            if (Date.now() - v.timestamp > CACHE_TTL) cache.delete(k);
+        }
+        void saveCache(cache); // async, non-blocking
+
+        return doc;
     } catch (err: any) {
         warn(`context7: failed to fetch ${libraryId} — ${err.message}`);
         return null;

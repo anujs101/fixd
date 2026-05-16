@@ -52,7 +52,7 @@ export function stopSpin() {
 export function printHeader(command: string) {
     console.log();
     console.log(`  ${BRAND} ${ARROW} ${C.cyan(command)}`);
-    console.log(`  ${chalk.dim("dev environment agent · nosana powered")}`);
+    console.log(`  ${chalk.dim("dev environment agent · openrouter + groq")}`);
     console.log(`  ${SEP}`);
     console.log();
 }
@@ -369,8 +369,9 @@ export function section(title: string) {
 /**
  * Shows a styled "agent wants to run" permission request.
  * Call this before asking the confirm() prompt.
+ * @param cwd - the project directory being operated on (not process.cwd())
  */
-export function agentWantsToRun(command: string, reason?: string) {
+export function agentWantsToRun(command: string, reason?: string, cwd?: string) {
     const bar = chalk.dim("─".repeat(54));
     console.log();
     console.log(`  ${C.amber("╭─")} ${C.amber(chalk.bold("agent wants to run"))}`);
@@ -380,7 +381,7 @@ export function agentWantsToRun(command: string, reason?: string) {
     console.log(`  ${C.amber("│")}`);
     console.log(`  ${C.amber("│")}  ${chalk.dim("$")} ${chalk.bold.white(command)}`);
     console.log(`  ${C.amber("│")}`);
-    console.log(`  ${C.amber("│")}  ${chalk.dim("cwd: ")}${chalk.dim(process.cwd())}`);
+    console.log(`  ${C.amber("│")}  ${chalk.dim("cwd: ")}${chalk.dim(cwd ?? process.cwd())}`);
     console.log(`  ${C.amber("╰")}${bar}`);
 }
 

@@ -1,6 +1,10 @@
 // ─── fixd patcher ─────────────────────────────────────────────────────────────
 // Parses agent-proposed file operations from structured markers, previews them
 // as colored diffs, and applies them atomically with user approval.
+//
+// Security: all resolved paths are validated to be within projectRoot.
+// Safety:   original files are backed up to .fixd/backups/<session>/ before
+//           every write, enabling `fixd undo` to restore them.
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -37,6 +41,59 @@ export interface ParseResult {
     parseErrors: string[];
 }
 
+// ─── Path traversal guard ─────────────────────────────────────────────────────
+
+/**
+ * Ensures a resolved absolute path is strictly inside projectRoot.
+ * Rejects `..`-escape attempts from LLM-generated paths.
+ */
+function assertWithinRoot(abs: string, projectRoot: string, opPath: string): string | null {
+    const root = path.resolve(projectRoot);
+    const resolved = path.resolve(abs);
+    // Allow exact match (projectRoot itself) or any child
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+        return `path traversal rejected: "${opPath}" resolves outside project root`;
+    }
+    return null; // OK
+}
+
+// ─── Backup system ────────────────────────────────────────────────────────────
+//
+// One backup session per patcher module lifetime (= one fixd command invocation).
+// Files are copied to .fixd/backups/<ISO-timestamp>/ before their first overwrite.
+// The path of the latest backup dir is written to .fixd/last-backup for `fixd undo`.
+
+let _sessionBackupDir: string | null = null;
+
+function getSessionBackupDir(projectRoot: string): string {
+    if (!_sessionBackupDir) {
+        const ts = new Date().toISOString().replace(/[:.]/g, "-");
+        _sessionBackupDir = path.join(projectRoot, ".fixd", "backups", ts);
+    }
+    return _sessionBackupDir;
+}
+
+/**
+ * Copy `abs` into the session backup dir (mirroring relative structure).
+ * Records the backup dir path in .fixd/last-backup for undo.
+ * Never throws.
+ */
+async function backupFile(abs: string, projectRoot: string): Promise<void> {
+    try {
+        const backupDir = getSessionBackupDir(projectRoot);
+        const rel = path.relative(projectRoot, abs);
+        const dest = path.join(backupDir, rel);
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        await fs.copyFile(abs, dest);
+        // Record the session backup dir so `fixd undo` can find it
+        const lastBackupFile = path.join(projectRoot, ".fixd", "last-backup");
+        await fs.mkdir(path.dirname(lastBackupFile), { recursive: true });
+        await fs.writeFile(lastBackupFile, backupDir, "utf-8");
+    } catch {
+        // Backup failure is non-fatal — warn only
+    }
+}
+
 // ─── Parser ───────────────────────────────────────────────────────────────────
 
 /**
@@ -62,7 +119,7 @@ export function parsePatchOperations(agentText: string): ParseResult {
     const editRe = /<<<EDIT:\s*([^\n>]+)>>>\n<<<SEARCH>>>\n([\s\S]*?)<<<REPLACE>>>\n([\s\S]*?)<<<END>>>/g;
     while ((m = editRe.exec(agentText)) !== null) {
         const filePath = m[1].trim();
-        const search   = m[2].trimEnd();  // preserve leading indent, strip trailing newline
+        const search   = m[2].trimEnd();
         const replace  = m[3].trimEnd();
         if (!filePath) { parseErrors.push("EDIT: empty path"); continue; }
         if (!search)   { parseErrors.push(`EDIT ${filePath}: empty search block`); continue; }
@@ -108,7 +165,6 @@ function contextDiff(original: string, search: string, replace: string): string 
     const searchIdx  = findSearchIndex(origLines, search.split("\n"));
 
     if (searchIdx === -1) {
-        // Fallback — show raw search/replace
         const rem = prefixLines(search.split("\n"),   "- ");
         const add = prefixLines(replace.split("\n"), "+ ");
         return `${rem}\n${add}`;
@@ -130,10 +186,6 @@ function contextDiff(original: string, search: string, replace: string): string 
 
 // ─── Preview ──────────────────────────────────────────────────────────────────
 
-/**
- * Generate a plain-text colored diff string for user preview.
- * Used by printFix() in display.ts which already handles coloring +/- lines.
- */
 export async function previewPatch(op: PatchOperation, projectRoot: string): Promise<string> {
     const abs = path.resolve(projectRoot, op.path);
 
@@ -180,11 +232,9 @@ function findSearchIndex(fileLines: string[], searchLines: string[]): number {
 function normalizeWs(s: string): string {
     return s.replace(/\r\n/g, "\n").replace(/\t/g, "    ").trimEnd();
 }
+
 // ─── JSON-aware patch helpers ────────────────────────────────────────────────
 
-/**
- * Deep-merge `override` into `base`. Arrays in override fully replace base arrays.
- */
 function deepMerge(base: any, override: any): any {
     if (
         typeof base !== "object" || base === null ||
@@ -209,9 +259,6 @@ function deepMerge(base: any, override: any): any {
     return result;
 }
 
-/**
- * Line-by-line diff of two pretty-printed JSON objects.
- */
 function generateJsonDiff(before: any, after: any): string {
     const beforeStr = JSON.stringify(before, null, 2).split("\n");
     const afterStr  = JSON.stringify(after,  null, 2).split("\n");
@@ -231,10 +278,6 @@ function generateJsonDiff(before: any, after: any): string {
     return lines.join("\n");
 }
 
-/**
- * JSON-aware edit: parse file + replace block as JSON, deep-merge, write back.
- * Falls back to string-based patching if either side is not valid JSON.
- */
 async function applyJsonPatch(
     op: Extract<PatchOperation, { op: "edit" }>,
     projectRoot: string,
@@ -248,7 +291,6 @@ async function applyJsonPatch(
         try {
             replacement = JSON.parse(op.replace);
         } catch {
-            // replace block isn't valid JSON — fall through to string-based patch
             return applyStringPatch(op, projectRoot, abs, raw);
         }
 
@@ -256,6 +298,7 @@ async function applyJsonPatch(
         const newContent = JSON.stringify(merged, null, 2) + "\n";
         const diff = generateJsonDiff(current, merged);
 
+        await backupFile(abs, projectRoot);
         await atomicWrite(abs, newContent);
 
         return { op: "edit", path: op.path, applied: true, diff };
@@ -265,7 +308,9 @@ async function applyJsonPatch(
 }
 
 /**
- * String-based edit — the existing search/replace logic, extracted for reuse.
+ * String-based edit using positional splice — fixes the String.replace()
+ * first-match-only bug. Uses findSearchIndex to locate the exact occurrence,
+ * then splices with slice() for a deterministic, position-correct replacement.
  */
 async function applyStringPatch(
     op: Extract<PatchOperation, { op: "edit" }>,
@@ -278,19 +323,24 @@ async function applyStringPatch(
         return { op: "edit", path: op.path, applied: false, diff: "", error: "file not found" };
     }
 
-    // Exact match
-    if (content.includes(op.search)) {
-        const updated = content.replace(op.search, op.replace);
+    // ── Exact match — use positional splice (not String.replace) ─────────────
+    const idx = content.indexOf(op.search);
+    if (idx !== -1) {
+        const updated = content.slice(0, idx) + op.replace + content.slice(idx + op.search.length);
+        await backupFile(abs, projectRoot);
         await atomicWrite(abs, updated);
         const diff = contextDiff(content, op.search, op.replace);
         return { op: "edit", path: op.path, applied: true, diff };
     }
 
-    // Whitespace-normalised retry
+    // ── Whitespace-normalised retry ───────────────────────────────────────────
     const normOrig   = normalizeWs(content);
     const normSearch = normalizeWs(op.search);
-    if (normOrig.includes(normSearch)) {
-        const updated = normOrig.replace(normSearch, normalizeWs(op.replace));
+    const normIdx    = normOrig.indexOf(normSearch);
+    if (normIdx !== -1) {
+        const normReplace = normalizeWs(op.replace);
+        const updated = normOrig.slice(0, normIdx) + normReplace + normOrig.slice(normIdx + normSearch.length);
+        await backupFile(abs, projectRoot);
         await atomicWrite(abs, updated);
         const diff = contextDiff(content, op.search, op.replace);
         return { op: "edit", path: op.path, applied: true, diff };
@@ -303,15 +353,24 @@ async function applyStringPatch(
 export async function applyPatch(op: PatchOperation, projectRoot: string): Promise<PatchResult> {
     const abs = path.resolve(projectRoot, op.path);
 
+    // ── Path traversal guard (5.2) ────────────────────────────────────────────
+    const traversalErr = assertWithinRoot(abs, projectRoot, op.path);
+    if (traversalErr) {
+        return { op: op.op, path: op.path, applied: false, diff: "", error: traversalErr };
+    }
+
     try {
         switch (op.op) {
             case "create": {
                 const exists = await fs.stat(abs).then(() => true).catch(() => false);
                 if (exists) {
-                    return {
-                        op: "create", path: op.path, applied: false, diff: "",
-                        error: "file already exists — use edit instead",
-                    };
+                    // Auto-promote WRITE on existing file to a full-file EDIT
+                    // instead of silently failing — this handles agent retries
+                    await backupFile(abs, projectRoot);
+                    await fs.mkdir(path.dirname(abs), { recursive: true });
+                    await atomicWrite(abs, op.content);
+                    const diff = prefixLines(op.content.split("\n"), "+ ");
+                    return { op: "create", path: op.path, applied: true, diff };
                 }
                 await fs.mkdir(path.dirname(abs), { recursive: true });
                 await atomicWrite(abs, op.content);
@@ -320,7 +379,6 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
             }
 
             case "edit": {
-                // JSON files get deep-merge patching first
                 if (op.path.endsWith(".json")) {
                     return applyJsonPatch(op, projectRoot, abs);
                 }
@@ -330,6 +388,7 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
             case "delete": {
                 let content = "";
                 try { content = await fs.readFile(abs, "utf-8"); } catch { /* gone already */ }
+                await backupFile(abs, projectRoot);
                 await fs.unlink(abs);
                 const diff = prefixLines(content.split("\n"), "- ");
                 return { op: "delete", path: op.path, applied: true, diff };
@@ -337,6 +396,10 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
 
             case "rename": {
                 const dest = path.resolve(projectRoot, op.to);
+                // Guard destination too
+                const destErr = assertWithinRoot(dest, projectRoot, op.to);
+                if (destErr) return { op: op.op, path: op.path, applied: false, diff: "", error: destErr };
+                await backupFile(abs, projectRoot);
                 await fs.mkdir(path.dirname(dest), { recursive: true });
                 await fs.rename(abs, dest);
                 return { op: "rename", path: op.path, applied: true, diff: `  ${op.path} → ${op.to}` };
@@ -348,6 +411,7 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
                 const updated = existing.endsWith("\n")
                     ? existing + op.content
                     : existing + "\n" + op.content;
+                await backupFile(abs, projectRoot);
                 await atomicWrite(abs, updated);
                 const diff = prefixLines(op.content.split("\n"), "+ ");
                 return { op: "append", path: op.path, applied: true, diff };
@@ -357,6 +421,7 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
                 let existing = "";
                 try { existing = await fs.readFile(abs, "utf-8"); } catch { /* new file */ }
                 const updated = op.content + "\n" + existing;
+                await backupFile(abs, projectRoot);
                 await atomicWrite(abs, updated);
                 const diff = prefixLines(op.content.split("\n"), "+ ");
                 return { op: "prepend", path: op.path, applied: true, diff };
@@ -381,10 +446,8 @@ export async function applyPatchSet(
     if (ops.length === 0) return results;
 
     const { autoApprove, confirmAll, onPreview } = options;
-    // Default: confirmEach = true unless overridden
     const confirmEach = options.confirmEach ?? (!autoApprove && !confirmAll);
 
-    // ── confirmAll: show all diffs, ask once ──────────────────────────────────
     if (confirmAll) {
         console.log();
         for (const op of ops) {
@@ -405,7 +468,6 @@ export async function applyPatchSet(
         return results;
     }
 
-    // ── autoApprove or confirmEach ────────────────────────────────────────────
     for (const op of ops) {
         const diff = await previewPatch(op, projectRoot);
 
@@ -437,10 +499,6 @@ export async function applyPatchSet(
 
 // ─── extractPatchesFromResponse ───────────────────────────────────────────────
 
-/**
- * Parse agent text, resolve paths, validate existence for edit/delete/rename.
- * Never throws.
- */
 export async function extractPatchesFromResponse(
     agentText: string,
     projectRoot: string
@@ -451,11 +509,17 @@ export async function extractPatchesFromResponse(
         for (const e of parseErrors) warn(`patcher parse error: ${e}`);
     }
 
-    // Filter out edit/delete/rename ops where the file doesn't exist
     const valid: PatchOperation[] = [];
     for (const op of operations) {
+        // Path traversal pre-filter
+        const abs = path.resolve(projectRoot, op.path);
+        const traversalErr = assertWithinRoot(abs, projectRoot, op.path);
+        if (traversalErr) {
+            warn(`patcher: ${traversalErr}`);
+            continue;
+        }
+
         if (op.op === "edit" || op.op === "delete" || op.op === "rename" || op.op === "append" || op.op === "prepend") {
-            const abs = path.resolve(projectRoot, op.path);
             const exists = await fs.stat(abs).then(() => true).catch(() => false);
             if (!exists) {
                 warn(`patcher: ${op.path} not found — skipping ${op.op}`);
@@ -470,10 +534,6 @@ export async function extractPatchesFromResponse(
 
 // ─── proposeAndApply — top-level convenience ──────────────────────────────────
 
-/**
- * Full pipeline: parse agent text → validate paths → show diffs → apply with approval.
- * Used by doctor.ts (chat) and init.ts (scaffold).
- */
 export async function proposeAndApply(
     agentText: string,
     projectRoot: string,
@@ -482,4 +542,12 @@ export async function proposeAndApply(
     const ops = await extractPatchesFromResponse(agentText, projectRoot);
     if (ops.length === 0) return [];
     return applyPatchSet(ops, projectRoot, options);
+}
+
+// ─── resetBackupSession — call at the start of each command ──────────────────
+// Clears the module-level session backup dir so each command gets its own
+// backup session rather than accumulating into a single one.
+
+export function resetBackupSession(): void {
+    _sessionBackupDir = null;
 }

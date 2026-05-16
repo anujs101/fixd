@@ -190,11 +190,13 @@ export interface CommandResult {
 
 export async function runCommand(command: string, cwd: string): Promise<CommandResult> {
     const resolved = resolveCommand(command, cwd);
+    // 4.3: configurable timeout — default 120s (was 60s), override with FIXD_COMMAND_TIMEOUT
+    const timeout = parseInt(process.env.FIXD_COMMAND_TIMEOUT ?? "120000", 10);
     const start = Date.now();
     try {
         const { stdout, stderr } = await execAsync(resolved, {
             cwd,
-            timeout: 60_000,
+            timeout,
             maxBuffer: 5 * 1024 * 1024,
         });
         return { command, resolvedCommand: resolved, stdout: stdout.trim(), stderr: stderr.trim(), exitCode: 0, durationMs: Date.now() - start };
