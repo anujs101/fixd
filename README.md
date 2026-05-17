@@ -4,9 +4,9 @@
 
 ### Your AI-powered dev environment agent — diagnose, scaffold, and ship faster.
 
-[![Version](https://img.shields.io/badge/version-0.1.0-6366f1?style=flat-square)](https://github.com/anujs101/fixd)
+[![Version](https://img.shields.io/badge/version-0.3.0-6366f1?style=flat-square)](https://github.com/anujs101/fixd)
 [![License](https://img.shields.io/badge/license-MIT-22c55e?style=flat-square)](LICENSE)
-[![Powered by Groq](https://img.shields.io/badge/LLM-Groq-f97316?style=flat-square)](https://console.groq.com)
+[![Powered by Groq](https://img.shields.io/badge/LLM-Groq%20%2B%20OpenRouter-f97316?style=flat-square)](https://console.groq.com)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3b82f6?style=flat-square)](https://typescriptlang.org)
 [![Bun Ready](https://img.shields.io/badge/runtime-Bun%20%2F%20Node-a855f7?style=flat-square)](https://bun.sh)
 
@@ -23,93 +23,134 @@
 ```
 $ fixd doctor
 
-  ✖ [TYPESCRIPT] src/index.ts:12:5  TS2345  Argument of type 'string' is not assignable...
-  ✖ [TYPESCRIPT] src/lib/auth.ts:44:3  TS2304  Cannot find name 'db'...
+  ─── explore ────────────────────────────
+  explorer: hono + prisma + neon detected
 
-  ─── issues found ──────────────────────────────────────────────────────
-  ● [HIGH]  MISSING_ENV_VAR
-     problem: DATABASE_URL is not set in .env
-     fix:     Add DATABASE_URL to .env and restart the dev server
+  ─── Diagnosis Summary ───────────────────
+  │ HIGH: DATABASE_URL missing from .env — Neon requires pooled + direct URLs
+  │ MEDIUM: tsconfig strict mode not enabled
 
-  ✔ apply 1 auto-fix? › yes
+  ✔ apply 2 auto-fixes? › yes
 
-  ─── verification ──────────────────────────────────────────────────────
-  ✔ 1 issue resolved
+  ─── verification ────────────────────────
+  [Fix Outcome: FIXED — 2 issues resolved]
   ✔ project is clean
 
-  ─── chat mode ─────────────────────────────────────────────────────────
+  ─── chat mode ───────────────────────────
   › you:
 ```
 
 ---
 
-##  Problem Statement
+##  What is fixd?
 
-Every developer has wasted hours on the same class of problems: a missing env var that crashes the server at 2am, a `tsconfig` that's silently misconfigured, a scaffold that's already outdated before the first commit, or a deployment that requires knowing five different CLI tools.
+Every developer has wasted hours on the same class of problems: a missing env var that crashes the server at 2am, a `tsconfig` silently misconfigured, a scaffold already outdated before the first commit, or a deployment that requires knowing five different CLI tools.
 
-These aren't hard problems. They're just **tedious, repetitive, and context-dependent** — which makes them perfect for an AI agent.
+These aren't hard problems — they're **tedious, repetitive, and context-dependent.** Which makes them perfect for an AI agent.
 
-**fixd** brings a language-model-powered agent directly into your terminal to handle exactly this. No dashboard. No SaaS. No agent server to babysit. Just run `fixd` in your project and get a senior dev looking over your shoulder.
-
----
-
-##  Solution Overview
-
-`fixd` is a zero-infrastructure CLI agent that:
-
-1. **Scans your project** deterministically — reads `package.json`, `tsconfig.json`, `.env`, Prisma schema, running ports, and more.
-2. **Runs stack-aware diagnostics** — executes `tsc`, `eslint`, `cargo check`, `go vet`, `mypy`, and other linters in parallel without any configuration from you.
-3. **Sends rich context to an LLM** (via Groq) to reason about root causes and suggest diffs.
-4. **Auto-applies safe fixes** with your approval, then **re-scans to verify** the fixes actually worked.
-5. **Drops into an agentic chat loop** where it can propose and run shell commands or write files — all gated by your explicit approval.
-6. **Remembers everything** across sessions via a local `.fixd/memory.json`, so it knows what was broken before and what was already fixed.
+**fixd** brings a multi-model agentic system directly into your terminal. No dashboard. No SaaS. No agent server. Just run `fixd` in your project and get a senior developer looking over your shoulder.
 
 ---
 
-##  Features
+##  Commands
 
-###  `fixd doctor` — Intelligent Diagnostics
-- **Multi-stack static analysis** — auto-detects TypeScript, Python, Rust, Go, Ruby, PHP, Java, and Kotlin projects; runs the right tool for each.
-- **Structured issue reporting** — severity-tagged (`HIGH / MEDIUM / LOW`), auto-fixable vs. manual triage, with suggested diffs.
-- **Post-fix verification** — re-scans after applying patches to confirm issues are actually resolved, not just suppressed.
-- **Agentic chat** — interactive REPL where the agent can propose and run commands (with your approval) in a self-correcting loop.
+| Command | Description |
+|---|---|
+| `fixd doctor` | Full diagnostic: scan → detect → explore → diagnose → synthesize → fix → verify → chat |
+| `fixd doctor --fast` | Single-agent mode — faster, skips parallel sub-agents |
+| `fixd doctor --plan` | Show diagnosis and proposed fix plan before applying any changes |
+| `fixd plan` | Alias for `fixd doctor --plan --fast` |
+| `fixd init` | Scaffold a new project from scratch with live docs |
+| `fixd init --yes` | Scaffold with defaults (Hono + Neon + Prisma + Bun) |
+| `fixd deploy` | Generate Dockerfile + Nosana job definition |
+| `fixd undo` | Restore all files from the last patch session |
+| `fixd status` | Check API connectivity and active models |
+
+---
+
+##  Core Features
+
+### `fixd doctor` — Intelligent Diagnostics
+
+**5-phase pipeline:**
+
+1. **Local scan** — reads `package.json`, `tsconfig.json`, `.env`, Prisma schema, running ports, node/bun versions
+2. **Stack diagnostics** — runs `tsc`, `eslint`, `mypy`, `cargo check`, `go vet` and more in parallel, no config needed
+3. **Parallel sub-agents** — `exploreProject()` (small model) + `diagnoseWithAgent()` (large model) analyse issues concurrently
+4. **Synthesis** — a third sub-agent deduplicates and escalates severity across both analyses into a unified summary
+5. **Agentic chat** — interactive loop with file-writing, command execution, and memory across turns
+
+**Smarter fix loop:**
+- **Fix-outcome tracking** — after every patch, fixd re-scans and computes `FIXED / NO CHANGE / REGRESSION`. The agent sees the outcome and routes accordingly.
+- **Hypothesis tracking** — every fix attempt is recorded as a hypothesis (`claim → file → outcome`). Repeated identical patches are blocked automatically.
+- **Outcome-based routing** — `NO CHANGE` escalates with the full hypothesis log; `REGRESSION` warns the agent to reassess completely; `FIXED` continues with the updated issue list.
+- **Depth pressure** — at depth 4, the agent is warned it has 2 attempts left. At depth 6, a `STUCK REPORT` is generated showing everything that was tried.
+- **Per-error format instructions** — Prisma issues force `WRITE .env` patches only; port conflicts force a bash kill command; TS errors force `EDIT` patch markers. Eliminates prose.
+
+### `fixd plan` — Safe Preview Mode
+
+```bash
+fixd plan         # or: fixd doctor --plan
+```
+
+Runs the full diagnostic pipeline, displays the synthesis summary, and asks for your approval before entering the chat loop. Zero changes are made unless you say yes.
 
 ### `fixd init` — AI Scaffolding with Live Docs
-- **Guided stack selection** — choose your framework (Hono / Express / Fastify), database (PostgreSQL / MySQL / SQLite / MongoDB), ORM (Prisma / Drizzle), auth (better-auth / Clerk), and frontend (Next.js / Vite-React).
-- **Context7 doc injection** — fetches real-time, version-accurate library documentation before generation, eliminating stale API hallucinations.
-- **Full project output** — generates `package.json`, `tsconfig.json`, `.env`, `.gitignore`, `README.md`, entry points, Prisma schema, and auth config in one shot.
-- **Auto-wired setup** — runs `git init` + initial commit + dependency install automatically after writing files.
 
-###  `fixd deploy` — Containerize & Ship
-- **AI-generated Dockerfile** — analyses your `package.json` and `tsconfig` to produce a production-ready multi-stage build.
+- **Guided interview** — framework, database, ORM, auth, frontend, package manager — with typo normalization
+- **Plan sub-agent** — generates a file manifest, required env vars, gotchas, and post-install steps before writing a single file
+- **Context7 doc injection** — fetches live, version-accurate library docs before generation, eliminating stale API hallucinations
+- **Completeness guard** — ensures auth files, Prisma schema, and frontend entry points are never omitted
+- **FIXD.md generation** — writes a `FIXD.md` into your project for future `fixd doctor` sessions to read for instant stack context
+- **Automated setup** — runs `git init` + commit + `bun/npm install` + `prisma generate` automatically
 
-###  Persistent Memory
-- Stores project history in `.fixd/memory.json` — last scan timestamp, known stack, previously fixed issues, and per-session chat summaries.
-- Injected into every LLM prompt so the agent has full context without you having to re-explain your project.
-- Capped at 50 fix records and 10 session summaries to stay prompt-efficient.
+### `fixd deploy` — Containerize & Ship
 
-###  Resilient LLM Layer
-- **Smart model routing** — lightweight tasks (`classify`, `explain`) use `llama-4-scout`; heavy tasks (`generate`, `diagnose`) use `qwen3-32b`.
-- **Automatic fallback** — if the large model is rate-limited or unavailable, transparently retries with the small model.
-- **Retry logic** — handles `429 Rate Limited` and `5xx` errors with exponential back-off, up to 3 attempts.
+Generates a production-ready `Dockerfile` and Nosana job definition from your project structure.
+
+### `fixd undo` — Atomic Rollback
+
+Every patch is backed up in `.fixd/backups/<timestamp>/` before writing. `fixd undo` restores all files from the last session atomically.
 
 ---
 
-##  Tech Stack
+##  Persistent Memory
 
-| Layer | Technology |
+fixd remembers across sessions via `.fixd/memory.json` (auto-gitignored):
+
+| Field | Description |
 |---|---|
-| **Runtime** | Node.js 23 / Bun |
-| **Language** | TypeScript 6 (ESM) |
-| **LLM Backend** | [Groq API](https://console.groq.com) (OpenAI-compatible) |
-| **Small Model** | `meta-llama/llama-4-scout-17b-16e-instruct` |
-| **Large Model** | `qwen/qwen3-32b` |
-| **Live Docs** | [Context7](https://context7.com) API |
-| **CLI UX** | `chalk`, `ora`, `inquirer`, `readline-sync` |
-| **Process Execution** | `execa` |
-| **File Watching** | `chokidar` |
-| **Containerization** | Docker (Node 23-slim base) |
-| **Diagnostics** | `tsc`, `eslint`, `mypy`, `flake8`, `cargo check`, `go vet`, `rubocop`, `phpstan` |
+| `fixedIssues` | Last 50 issues that were fixed, with timestamps |
+| `chatSummaries` | Last 10 LLM-generated session summaries (2 sentences each) |
+| `causalChain` | Last 30 causal entries — file changed, issue type, action taken, outcome, follow-up issues |
+| `stackPatterns` | Up to 50 fix patterns keyed by stack+issueType, with confidence scores that grow across projects |
+
+**Causal history** is injected into every LLM prompt:
+```
+[2026-05-17] prisma/schema.prisma | PRISMA_POOLED_WITHOUT_DIRECT_URL → added directUrl → resolved
+[2026-05-16] .env | MISSING_DATABASE_URL → added placeholder → no_change → followup: PRISMA_POOLED
+```
+
+**Stack patterns** let fixd get smarter across projects — a fix that worked 3 times on `hono+prisma+postgresql` gets a confidence boost and is suggested first next time.
+
+---
+
+##  LLM Architecture
+
+fixd uses **three model tiers** routed by task:
+
+| Task | Model | Provider |
+|---|---|---|
+| `classify`, `explain` | `llama-4-scout-17b` | Groq (fast) |
+| `generate`, `diagnose` | `gpt-o1-120b` | OpenRouter (primary) |
+| Large model fallback | Clarifai API | Clarifai |
+| Last resort | Small model | Groq |
+
+**New in 0.3.0:**
+
+- **Relevance-gated Context7** — before fetching library docs, a small-model classifier decides which (if any) project libraries are relevant to the current query. Irrelevant queries pay zero doc tokens.
+- **Iterative exploration** — `exploreProject()` has a two-pass confidence check. If the small model returns `unknown` on framework/runtime/packageManager, it fires a second large-model pass to correct and complete the result.
+- **File relevance scoring** — `readRelevantFiles()` passes candidate files through a small-model filter before reading them. Focused bug-fix queries only load the relevant files.
 
 ---
 
@@ -130,39 +171,47 @@ These aren't hard problems. They're just **tedious, repetitive, and context-depe
     ┌────────▼──────────────────────▼────────────────┐
     │                  cli/lib/                       │
     │                                                 │
-    │  llm.ts        ← Groq API client                │
-    │  agent.ts      ← multi-turn conversation state  │
-    │  diagnostics.ts← stack detection + linting      │
-    │  memory.ts     ← .fixd/memory.json persistence  │
-    │  context7.ts   ← live library doc fetcher       │
-    │  patcher.ts    ← file diff proposal + apply     │
-    │  executor.ts   ← shell command extraction + run │
-    │  display.ts    ← terminal UI primitives         │
+    │  llm.ts          ← multi-service LLM routing    │
+    │  agent.ts        ← session state + system prompt│
+    │  sub-agents.ts   ← explore / diagnose / synth   │
+    │  diagnostics.ts  ← stack detection + linting    │
+    │  memory.ts       ← causal chain + stack patterns│
+    │  context7.ts     ← relevance-gated doc fetcher  │
+    │  patcher.ts      ← atomic file patch + backup   │
+    │  executor.ts     ← shell command extraction      │
+    │  projectReader.ts← scored file relevance reader │
+    │  command-classifier.ts ← 3-stage safety check   │
+    │  display.ts      ← terminal UI primitives        │
     └─────────────────────────┬──────────────────────┘
                               │
     ┌─────────────────────────▼──────────────────────┐
     │               src/actions/                      │
-    │  scanFiles.ts  ← project scanner (env, pkg, ts) │
+    │  scanFiles.ts  ← project scanner                │
     │  fixEnv.ts     ← deterministic issue detector   │
     └────────────────────────────────────────────────┘
 ```
 
-### Key Data Flows
+### `fixd doctor` data flow
 
-**`fixd doctor` flow:**
 ```
-cwd → scanProject() → runDiagnostics() → detectIssues()
-    → [LLM] structured diagnosis prompt
-    → renderDiagnosisResponse() → user approval
-    → apply fixes → re-scan → verify
-    → agenticTurn() chat loop (infinite, with context7 enrichment)
-```
-
-**`fixd init` flow:**
-```
-user prompts → fetchDocsForStack() [Context7 API]
-            → scaffold prompt + live docs → askStream() [Groq]
-            → proposeAndApply() → git init → install deps
+cwd
+ → scanProject()              # reads pkg.json, tsconfig, .env, prisma, ports
+ → runDiagnostics()           # tsc / eslint / mypy / cargo / go vet (parallel)
+ → detectIssues()             # structured DetectedIssue[] list
+ → exploreProject()           # small model → ExploreResult JSON (2-pass if low confidence)
+ → diagnoseWithAgent()        # large model → structured SEVERITY/TYPE/PROBLEM/FIX blocks
+ → synthesizeDiagnosis()      # small model → unified summary (dedup + severity escalation)
+ → [--plan: confirm before continuing]
+ → auto-fix phase             # apply auto-fixable issues with verification
+ → agenticTurn() chat loop
+     │
+     ├── scoreFileRelevance()    # filter which files to read this turn
+     ├── scoreDocRelevance()     # filter which libraries need docs
+     ├── sendMessage()           # LLM turn
+     ├── proposeAndApply()       # parse + apply patches
+     ├── computeFixOutcome()     # before/after scan → FIXED/NO CHANGE/REGRESSION
+     ├── recordStackPattern()    # update confidence in memory
+     └── recurse with outcome-routed message
 ```
 
 ---
@@ -173,54 +222,55 @@ user prompts → fetchDocsForStack() [Context7 API]
 
 - **Node.js** ≥ 18 or **Bun** ≥ 1.0
 - A **Groq API key** — free tier at [console.groq.com/keys](https://console.groq.com/keys)
+- _(Recommended)_ An **OpenRouter API key** for large model calls — [openrouter.ai](https://openrouter.ai)
 - _(Optional)_ A **Context7 API key** for live library docs — [context7.com](https://context7.com)
 
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/anujs101/fixd.git
 cd fixd
-
-# Install dependencies
-npm install
-# or
-bun install
+npm install   # or: bun install
 ```
 
 ### Environment Setup
 
+The recommended location is `~/.config/fixd/.env` — this keeps your keys out of any project repository:
+
 ```bash
-cp .env.example .env
-```
-
-Open `.env` and fill in your keys:
-
-```env
+mkdir -p ~/.config/fixd
+cat > ~/.config/fixd/.env << 'EOF'
 # Required
 GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxx
 
-# Optional — enables live library documentation in init + chat
+# Recommended — large model calls (diagnose, generate)
+OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxx
+
+# Optional — live library docs in init + chat
 CONTEXT7_API_KEY=your_context7_key
 
-# Optional model overrides
-# SMALL_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
-# LARGE_MODEL=qwen/qwen3-32b
+# Optional tuning
+# FIXD_AUTO_RUN_LEVEL=moderate   # conservative | moderate | aggressive
+# FIXD_COMMAND_TIMEOUT=120000    # ms
+EOF
 ```
 
 ### Running Locally
 
 ```bash
-# Verify API connectivity
-npm run fixd status
+# Verify connectivity
+npm run fixd -- status
 
-# Run from any project directory
-npm run fixd doctor
-npm run fixd init
-npm run fixd deploy
+# Diagnose your project
+cd /path/to/your/project
+npm run fixd -- doctor
+
+# Scaffold a new project
+mkdir my-api && cd my-api
+npm run fixd -- init
 ```
 
-Or, if you want to use it globally across your machine:
+Or install globally:
 
 ```bash
 npm link        # or: bun link
@@ -229,38 +279,52 @@ fixd status     # now available system-wide
 
 ---
 
-##  Usage
+##  Usage Examples
 
-### Diagnose a broken project
+### Diagnose and fix a broken project
 
 ```bash
-cd /path/to/your/project
 fixd doctor
 ```
 
 fixd will:
-1. Scan all config files and detect your stack
-2. Run the relevant type checkers and linters in parallel
-3. Show a structured issue report — severity, root cause, suggested fix
-4. Ask if you want to apply auto-fixable issues
-5. Verify the fixes, then drop into an interactive chat
+1. Scan config files and detect your stack
+2. Run type checkers and linters in parallel
+3. Explore your project structure with a small model
+4. Diagnose with a large model and synthesize a unified summary
+5. Apply auto-fixable issues with your approval
+6. Verify the fixes, then open an interactive chat
 
 **In chat mode:**
 
 ```
 › you: why is my prisma connection failing on Neon?
 
-  fixd: Your DATABASE_URL is using the direct connection string — Neon requires
-        the pooled URL for serverless environments. Add a separate DIRECT_URL for
-        migrations.
+  fixd: Your DATABASE_URL uses the direct connection string — Neon requires
+        the pooled URL for serverless. You need a separate DIRECT_URL for migrations.
 
-  ─── agent wants to run ────────────────────────────────────────
-  $ npx prisma db push
+  ─── agent wants to patch ───────────────────────────────
+  <<<EDIT: prisma/schema.prisma>>>
+  <<<SEARCH>>>
+    url = env("DATABASE_URL")
+  <<<REPLACE>>>
+    url          = env("DATABASE_URL")
+    directUrl    = env("DIRECT_URL")
+  <<<END>>>
 
-  run this command? › yes
+  apply this patch? › yes
+  [Fix Outcome: FIXED — 1 issue resolved]
 ```
 
----
+### Preview fixes before applying
+
+```bash
+fixd plan
+# or
+fixd doctor --plan
+```
+
+Shows the full diagnosis summary and asks for your approval before the chat loop begins. No changes are made unless you confirm.
 
 ### Scaffold a new project
 
@@ -272,41 +336,20 @@ fixd init
 ```
   project name       my-api
   backend framework  hono
-  database           postgres
-  postgres hosting   neon
+  database           postgres (neon)
   orm                prisma
   auth               better-auth
   frontend           none
   package manager    bun
 
-  scaffold this project? › yes
-
-  fetching latest docs...  ✔ fetched docs for: hono, prisma, better-auth
-  generating... (7 files so far)
-  ✔ created: package.json
-  ✔ created: tsconfig.json
-  ✔ created: src/index.ts
-  ✔ created: prisma/schema.prisma
-  ✔ created: src/lib/auth.ts
-  ✔ created: .env
-  ✔ created: .gitignore
-  ✔ git repository initialised with initial commit
+  ✔ plan: 8 files, 3 env vars, 2 gotchas
+  fetching docs: hono, prisma, better-auth
+  generating...
+  ✔ created: package.json, tsconfig.json, src/index.ts ...
+  ✔ git initialized and committed
   ✔ dependencies installed
-```
-
----
-
-### Check API + model status
-
-```bash
-fixd status
-```
-
-```
-  ✔ Groq API reachable
-  small model : meta-llama/llama-4-scout-17b-16e-instruct
-  large model : qwen/qwen3-32b
-  project     : /Users/you/my-project
+  ✔ prisma generate complete
+  ✔ FIXD.md written for future fixd sessions
 ```
 
 ---
@@ -315,111 +358,99 @@ fixd status
 
 ```
 fixd/
-├── cli/                        # CLI entry points and command implementations
-│   ├── index.ts                # Main entry — argument parsing, preflight, routing
-│   ├── doctor.ts               # Diagnose, fix, verify, and chat loop
-│   ├── init.ts                 # Guided project scaffolding
-│   ├── deploy.ts               # Dockerfile generation + Nosana deploy
+├── cli/
+│   ├── index.ts                # Entry — arg parsing, preflight, routing
+│   ├── doctor.ts               # Doctor pipeline + agenticTurn() loop
+│   ├── init.ts                 # Scaffolding interview + generation
+│   ├── deploy.ts               # Dockerfile + Nosana job generation
+│   ├── undo.ts                 # Backup restoration
 │   └── lib/
-│       ├── llm.ts              # Groq API client — ask(), askStream(), chat()
-│       ├── agent.ts            # Multi-turn conversation state management
+│       ├── llm.ts              # Multi-service LLM client (Groq/OpenRouter/Clarifai)
+│       ├── agent.ts            # Session state, system prompt, history trimming
+│       ├── sub-agents.ts       # exploreProject / diagnoseWithAgent / synthesizeDiagnosis
 │       ├── diagnostics.ts      # Stack detection + parallel linter runner
-│       ├── memory.ts           # .fixd/memory.json read/write/summarize
-│       ├── context7.ts         # Context7 live doc fetching + prompt injection
-│       ├── patcher.ts          # <<WRITE:>> file diff proposal + apply
+│       ├── memory.ts           # causalChain + stackPatterns + session summaries
+│       ├── context7.ts         # Relevance-gated doc fetcher + disk cache
+│       ├── patcher.ts          # Patch marker parser + atomic apply + backup
 │       ├── executor.ts         # Shell command extraction + execution
+│       ├── projectReader.ts    # Scored file relevance reader
+│       ├── command-classifier.ts # 3-stage safety pipeline
 │       └── display.ts          # Terminal UI: spinners, colours, prompts
-│
 ├── src/
 │   └── actions/
-│       ├── scanFiles.ts        # Project scanner (env vars, package.json, tsconfig, prisma, ports)
-│       └── fixEnv.ts           # Deterministic issue detector + auto-fix rules
-│
-├── .fixd/                      # Auto-created per project — gitignored
-│   └── memory.json             # Persistent project memory (history, fixes, stack)
-│
-├── .env.example                # Environment variable template
-├── Dockerfile                  # Container build for Nosana deployment
-├── tsconfig.json               # TypeScript compiler config
-└── package.json                # Scripts and dependencies
+│       ├── scanFiles.ts        # Project scanner (env, pkg, ts, prisma, ports)
+│       └── fixEnv.ts           # Deterministic issue detector + auto-fixers
+├── characters/
+│   └── agent.character.json    # Agent persona, style rules, patch format
+├── .fixd/                      # Per-project, auto-gitignored
+│   ├── memory.json             # Persistent memory (causal chain, stack patterns)
+│   └── backups/                # Patch backups for fixd undo
+├── .env.example                # All supported env vars with comments
+└── CONTEXT.md                  # LLM-friendly project context (gitignored)
 ```
 
 ---
 
-##  Internal APIs
+##  Supported Stacks
 
-fixd is a CLI tool and has no public HTTP API. The following describes the internal module contracts.
-
-### `cli/lib/llm.ts`
-
-| Function | Description |
-|---|---|
-| `ask(prompt, task)` | Single-turn completion. Returns `string`. Routes to small or large model by task. |
-| `askStream(prompt, task)` | Streaming generator. Yields text chunks as they arrive. Used by `init`. |
-| `chat(messages, task)` | Multi-turn completion. Accepts a full `Message[]` history. |
-
-**Task routing:**
-
-| Task | Model |
-|---|---|
-| `classify`, `explain` | `llama-4-scout` (small, fast) |
-| `generate`, `diagnose` | `qwen3-32b` (large, accurate) |
-| `chat` | Auto-upgrades to large if the message looks like code generation |
-
----
-
-### `cli/lib/diagnostics.ts`
-
-| Function | Description |
-|---|---|
-| `runDiagnostics(projectPath)` | Auto-detects stack and runs all applicable checkers in parallel. Returns `CheckerResult[]`. |
-| `formatDiagnosticsForContext(results)` | Formats results as structured text for LLM prompt injection. |
-| `getAllErrors(results)` | Flattens all `ParsedError` objects across stacks into a single array. |
-
-**Supported stacks and tools:**
+### Diagnostics
 
 | Stack | Tool |
 |---|---|
 | TypeScript | `tsc --noEmit` |
-| JavaScript | `eslint` (compact format) |
+| JavaScript | `eslint` |
 | Python | `mypy`, `flake8` |
 | Rust | `cargo check` |
 | Go | `go vet` |
 | Ruby | `rubocop` |
-| PHP | `php -l`, `phpstan` |
+| PHP | `php -l` |
 | Java | `mvn compile` |
 | Kotlin/Java | `gradle check` |
 
+### Scaffolding (`fixd init`)
+
+| Category | Options |
+|---|---|
+| **Backend** | Hono, Express, Fastify, NestJS |
+| **Database** | PostgreSQL, MySQL, SQLite, MongoDB |
+| **Hosting** | Neon, Supabase, PlanetScale, local |
+| **ORM** | Prisma, Drizzle |
+| **Auth** | better-auth, Clerk, custom JWT/session |
+| **Frontend** | Next.js, Vite + React, none |
+| **Package manager** | Bun, npm, pnpm, yarn |
+
 ---
 
-### `cli/lib/memory.ts`
+##  Security Model
 
-| Function | Description |
-|---|---|
-| `loadMemory(projectRoot)` | Reads `.fixd/memory.json`. Returns empty memory if missing. |
-| `saveMemory(memory)` | Atomically writes memory via temp file + rename. Never throws. |
-| `updateFromScan(memory, scan)` | Updates `knownStack` and `lastScanned` from a fresh scan. |
-| `recordFix(memory, fixes)` | Appends applied fixes to `fixedIssues` (capped at 50). |
-| `summarizeSession(memory, log)` | Asks LLM for a 2-sentence summary and appends to `chatSummaries`. |
-| `formatMemoryForPrompt(memory)` | Serializes memory as a prompt prefix for LLM context injection. |
+- **Path traversal protection** — all patch operations are validated to stay within `projectRoot`. Any path escaping the project is rejected.
+- **Atomic writes** — files are written to `.fixd.tmp` then renamed atomically. Partial writes never corrupt your code.
+- **Command classification** — a 3-stage pipeline (hardcoded allowlist → safety regex → LLM classifier) gates every shell command before it runs. Destructive patterns (`rm`, `sudo`, `git reset --hard`, pipe-to-shell) always require explicit approval.
+- **Memory isolation** — `.fixd/memory.json` is auto-gitignored. Your fix history and env var names never leave your machine.
 
 ---
 
-### `cli/lib/context7.ts`
+##  Environment Variables
 
-| Function | Description |
-|---|---|
-| `resolveLibraryId(name)` | Maps a library name to a Context7 ID. Falls back to search API. |
-| `fetchDocs(libraryId, topic, maxTokens)` | Fetches documentation for a specific library and topic. |
-| `fetchDocsForStack(stack)` | Fetches docs for an entire chosen stack, capped at 12,000 tokens. |
-| `fetchDocsForQuery(query, projectLibraries)` | Fetches docs for libraries mentioned in a chat query. |
-| `formatDocsForPrompt(docs)` | Formats fetched docs as a prompt prefix for LLM injection. |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GROQ_API_KEY` | **yes** | — | Small model (Llama 4 Scout via Groq) |
+| `OPENROUTER_API_KEY` | recommended | — | Large model primary (OpenRouter) |
+| `CLARIFAI_PAT` | fallback | — | Large model fallback if OpenRouter fails |
+| `CONTEXT7_API_KEY` | optional | — | Live library docs |
+| `FIXD_AUTO_RUN_LEVEL` | optional | `moderate` | `conservative` / `moderate` / `aggressive` |
+| `FIXD_COMMAND_TIMEOUT` | optional | `120000` | Command timeout in ms |
+| `FIXD_EXPLORE_MODEL` | optional | `small` | `small` / `large` for explore/classify calls |
+| `OPENROUTER_LARGE_MODEL` | optional | — | Override large model name |
+| `SMALL_MODEL` | optional | — | Override small model name |
+
+Config is loaded in priority order: `~/.config/fixd/.env` → `~/.fixd/.env` → `<project>/.env`
 
 ---
 
 ##  Contributing
 
-Pull requests are welcome. For significant changes, please open an issue first to discuss the direction.
+Pull requests are welcome. For significant changes, please open an issue first to discuss direction.
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feat/your-feature`

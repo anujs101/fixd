@@ -2,7 +2,8 @@
 // Fetches up-to-date library docs from context7.com and injects them into
 // LLM prompts, preventing stale/outdated code generation.
 
-import { warn } from "./display.js";
+import { warn, info } from "./display.js";
+import { ask } from "./llm.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -378,4 +379,44 @@ export function formatDocsForPrompt(docs: LibraryDoc[]): string {
 
     parts.push("--- END DOCUMENTATION ---");
     return parts.join("\n");
+}
+
+// ─── scoreDocRelevance (Upgrade 6) ───────────────────────────────────────────
+//
+// Uses small model to decide which (if any) libraries in the project are
+// relevant to the current user query. Returns a filtered list of library IDs.
+// If none are relevant, returns [] so the caller can skip doc injection entirely.
+
+export async function scoreDocRelevance(
+    query: string,
+    availableLibraryIds: string[]
+): Promise<string[]> {
+    if (availableLibraryIds.length === 0) return [];
+
+    // Build name ↔ ID mapping for readable prompt
+    const nameToId: Record<string, string> = {};
+    for (const [name, id] of Object.entries(KNOWN_LIBRARIES)) {
+        if (availableLibraryIds.includes(id as string)) {
+            nameToId[name] = id as string;
+        }
+    }
+    const libNames = Object.keys(nameToId);
+    if (libNames.length === 0) return [];
+
+    try {
+        const result = await ask(
+            `Given this user query: '${query}', which of these libraries are directly relevant: ${libNames.join(", ")}? Reply with only a JSON array of relevant library names. If none are relevant, return [].`,
+            "classify"
+        );
+        const match = result.match(/\[[\s\S]*?\]/);
+        if (!match) return [];
+        const names: string[] = JSON.parse(match[0]);
+        // Map names back to library IDs, filtering unknowns
+        return names
+            .map((n) => nameToId[n.toLowerCase().trim()] ?? KNOWN_LIBRARIES[n.toLowerCase().trim()])
+            .filter((id): id is string => !!id);
+    } catch {
+        // On classifier error, return all available (safe fallback — might fetch more but won't miss)
+        return availableLibraryIds;
+    }
 }

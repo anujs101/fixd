@@ -10,12 +10,14 @@
 
 import { ask } from "./llm.js";
 import { readRelevantFiles } from "./projectReader.js";
+import type { DetectedIssue } from "../../src/actions/fixEnv.js";
 
 // ─── Explore sub-agent ────────────────────────────────────────────────────────
 //
 // READ-ONLY. Analyses project structure and returns a structured summary.
 // Runs on small model (fast). Adapted from agent-prompt-explore.md +
 // agent-prompt-background-job-agent-instructions.md.
+// Upgrade 3: iterative two-pass with confidence check.
 
 const EXPLORE_SYSTEM_PROMPT = `You are a read-only project explorer for fixd, a developer CLI tool.
 Your task: analyse the project structure and return a concise structured summary.
@@ -62,21 +64,65 @@ export interface ExploreResult {
     notes: string | null;
 }
 
+/**
+ * Iterative project explorer (Upgrade 3).
+ * Pass 1: small model — fast baseline.
+ * Pass 2: large model — only if Pass 1 has low confidence on key fields.
+ * Merges results (Pass 2 wins on non-null/non-unknown fields).
+ */
 export async function exploreProject(projectPath: string): Promise<ExploreResult | null> {
     try {
         const fileContext = await readRelevantFiles("project structure overview", projectPath).catch(() => "");
 
-        const prompt = fileContext
+        const pass1Prompt = fileContext
             ? `${fileContext}\n\n[Working directory: ${projectPath}]\n\nAnalyse the project structure above and return the JSON summary.`
             : `[Working directory: ${projectPath}]\n\nList files and analyse project structure. Return the JSON summary.`;
 
         const modelTask = (process.env.FIXD_EXPLORE_MODEL ?? "small") === "large" ? "diagnose" : "classify";
-        const result = await ask(prompt, modelTask, EXPLORE_SYSTEM_PROMPT);
+        const result1 = await ask(pass1Prompt, modelTask, EXPLORE_SYSTEM_PROMPT);
 
-        const jsonMatch = result.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) return null;
+        const jsonMatch1 = result1.match(/\{[\s\S]*\}/);
+        if (!jsonMatch1) return null;
 
-        return JSON.parse(jsonMatch[0]) as ExploreResult;
+        const pass1 = JSON.parse(jsonMatch1[0]) as ExploreResult;
+
+        // ── Confidence check ─────────────────────────────────────────────────
+        const lowConfidence =
+            !pass1.framework ||
+            !pass1.runtime || pass1.runtime === "unknown" ||
+            !pass1.packageManager || pass1.packageManager === "unknown" ||
+            pass1.hasTypeScript === undefined || pass1.hasTypeScript === null;
+
+        if (!lowConfidence) return pass1;
+
+        // ── Pass 2: large model to correct and complete ───────────────────────
+        const pass2Prompt = [
+            `Pass 1 exploration result (may be incomplete — low confidence on some fields):`,
+            `\`\`\`json`,
+            JSON.stringify(pass1, null, 2),
+            `\`\`\``,
+            ``,
+            fileContext || `[Working directory: ${projectPath}]`,
+            ``,
+            `Correct and complete the ExploreResult JSON. Return only the corrected JSON object.`,
+        ].join("\n");
+
+        const result2 = await ask(pass2Prompt, "diagnose", EXPLORE_SYSTEM_PROMPT).catch(() => "");
+        const jsonMatch2 = result2.match(/\{[\s\S]*\}/);
+        if (!jsonMatch2) return pass1; // pass1 as fallback
+
+        const pass2 = JSON.parse(jsonMatch2[0]) as Partial<ExploreResult>;
+
+        // Merge: pass2 wins on non-null, non-"unknown" fields
+        const merged: ExploreResult = { ...pass1 };
+        for (const key of Object.keys(pass2) as Array<keyof ExploreResult>) {
+            const val = (pass2 as any)[key];
+            if (val !== null && val !== undefined && val !== "unknown") {
+                (merged as any)[key] = val;
+            }
+        }
+
+        return merged;
     } catch {
         return null;
     }
@@ -86,6 +132,7 @@ export async function exploreProject(projectPath: string): Promise<ExploreResult
 //
 // Takes structured scan data + detected issues, returns structured issue blocks.
 // Runs on large model.
+// Upgrade 4: ExploreResult is injected as an explicit EXPLORATION CONTEXT block.
 
 const DIAGNOSE_SYSTEM_PROMPT = `You are fixd, a terminal-native dev environment diagnostic agent.
 Respond ONLY in the exact structured format below. No prose. No thinking out loud.
@@ -118,29 +165,70 @@ RULES:
 export async function diagnoseWithAgent(
     scanContext: string,
     issueList: string,
-    exploreContext?: ExploreResult | null
+    exploreContext: ExploreResult   // required — enforce sub-agent isolation
 ): Promise<string> {
     const parts: string[] = [
+        // Upgrade 4: exploration context always opened first
+        "--- EXPLORATION CONTEXT ---",
+        `Framework: ${exploreContext.framework ?? "unknown"}`,
+        `Runtime: ${exploreContext.runtime}`,
+        `Package Manager: ${exploreContext.packageManager}`,
+        `TypeScript: ${exploreContext.hasTypeScript}`,
+        `Prisma: ${exploreContext.hasPrisma}`,
+        `Missing Env Vars: ${exploreContext.missingEnvVars?.join(", ") || "none"}`,
+        "--- END EXPLORATION CONTEXT ---",
+        "",
+        "Given the above project context and the scan data below, diagnose issues.",
+        "",
         "SCAN DATA:",
         "```",
         scanContext,
         "```",
         "",
+        `DETECTED ISSUES:`,
+        issueList,
     ];
-
-    if (exploreContext) {
-        parts.push("ADDITIONAL CONTEXT (from project explorer):");
-        parts.push("```json");
-        parts.push(JSON.stringify(exploreContext, null, 2));
-        parts.push("```");
-        parts.push("");
-    }
-
-    parts.push(`DETECTED ISSUES:`, issueList);
 
     const prompt = parts.join("\n");
 
     return ask(prompt, "diagnose", DIAGNOSE_SYSTEM_PROMPT);
+}
+
+// ─── Synthesis sub-agent ──────────────────────────────────────────────────────
+//
+// Upgrade 4: Merges explore + diagnose outputs into a single unified summary.
+// Runs on small model — fast, no expensive LLM call needed for de-duplication.
+
+const SYNTHESIS_SYSTEM_PROMPT = `You are fixd. Synthesize multiple sources of issue information into a single concise summary.
+Remove duplicates. Escalate severity if multiple sources agree on the same issue.
+Output plain text only. Max 20 lines. No filler. Be terse.`;
+
+export async function synthesizeDiagnosis(
+    exploreResult: ExploreResult,
+    diagnoseOutput: string,
+    detectedIssues: DetectedIssue[]
+): Promise<string> {
+    const issueList = detectedIssues.length > 0
+        ? detectedIssues.map((i) => `- [${i.severity}] ${i.type}: ${i.description}`).join("\n")
+        : "No structured issues detected.";
+
+    const prompt = [
+        `Given the following exploration result, agent diagnosis, and structured issue list,`,
+        `produce a single unified issue summary. Remove duplicates. Escalate severity if multiple sources agree.`,
+        `Output plain text, max 20 lines.`,
+        ``,
+        `EXPLORATION RESULT:`,
+        JSON.stringify(exploreResult, null, 2),
+        ``,
+        `AGENT DIAGNOSIS:`,
+        diagnoseOutput || "(no diagnosis output)",
+        ``,
+        `STRUCTURED ISSUES:`,
+        issueList,
+    ].join("\n");
+
+    // Always uses small model — synthesis is a consolidation task, not analysis
+    return ask(prompt, "classify", SYNTHESIS_SYSTEM_PROMPT);
 }
 
 // ─── Plan scaffold sub-agent ──────────────────────────────────────────────────
@@ -150,7 +238,7 @@ export async function diagnoseWithAgent(
 // Adapted from agent-prompt-plan-mode-enhanced.md.
 
 const PLAN_SCAFFOLD_SYSTEM_PROMPT = `You are a scaffold planner for fixd.
-Given a project stack spec, return a JSON plan of which files to generate and any non-obvious requirements.
+Given a project stack spec, return a JSON plan of exactly which files to generate.
 
 OUTPUT FORMAT (strict JSON, no markdown wrapping):
 {
@@ -168,11 +256,20 @@ OUTPUT FORMAT (strict JSON, no markdown wrapping):
   ]
 }
 
-RULES:
-- List files in dependency order (configs first, then source files)
-- Only include env vars that are non-obvious for this stack
-- Gotchas must be specific to this exact stack combination, not generic tips
-- installStepsAfter: only commands that MUST run after npm/bun install`;
+FILE PLANNING RULES:
+- List files in dependency order: config files first, then shared libs, then backend, then frontend
+- Always include: package.json, tsconfig.json, .env, .env.example, .gitignore, src/index.ts
+- Auth: if auth is anything other than "none", you MUST include a dedicated auth source file
+  (e.g. src/lib/auth.ts or src/middleware/auth.ts) that implements the described strategy
+- ORM: if orm is "prisma", include prisma/schema.prisma; if "drizzle", include drizzle.config.ts and a schema file
+- Frontend: if frontend is anything other than "none", include at minimum:
+  frontend/package.json, frontend/src/App.tsx (or equivalent entry), and frontend config file
+- Only include env vars that are non-obvious for this stack combination
+- Gotchas: only stack-specific, not generic TypeScript/Node.js advice
+- installStepsAfter: only commands required immediately after install (e.g. prisma generate)
+- A free-form auth description like "cookies based jwt" or "firebase auth" is still valid auth —
+  plan a dedicated file for it that implements exactly what was described`;
+
 
 export interface ScaffoldPlan {
     files: Array<{ path: string; reason: string }>;

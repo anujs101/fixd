@@ -41,6 +41,12 @@ function printHelp() {
         `    ${chalk.cyan("fixd doctor --fast")}   ${chalk.dim("single-agent mode (faster, no parallel sub-agents)")}`
     );
     console.log(
+        `    ${chalk.cyan("fixd doctor --plan")}   ${chalk.dim("show diagnosis and fix plan before applying any changes")}`
+    );
+    console.log(
+        `    ${chalk.cyan("fixd plan")}            ${chalk.dim("alias for: fixd doctor --plan --fast")}`
+    );
+    console.log(
         `    ${chalk.cyan("fixd init")}            ${chalk.dim("scaffold a new project from scratch")}`
     );
     console.log(
@@ -163,9 +169,9 @@ async function launchUndo() {
     await runUndo();
 }
 
-async function runDoctor(fast = false) {
+async function runDoctor(fast = false, plan = false) {
     const { runDoctor: _runDoctor } = await import("./doctor.js");
-    await _runDoctor(undefined, fast);
+    await _runDoctor(undefined, fast, plan);
 }
 
 async function runInit(useDefaults = false) {
@@ -198,7 +204,7 @@ async function main() {
     switch (command) {
         case "doctor": {
             if (!(await preflight())) break;
-            await runDoctor(flags.includes("--fast"));
+            await runDoctor(flags.includes("--fast"), flags.includes("--plan"));
             break;
         }
         case "init": {
@@ -209,6 +215,12 @@ async function main() {
         case "deploy": {
             if (!(await preflight())) break;
             await runDeploy();
+            break;
+        }
+        case "plan": {
+            if (!(await preflight())) break;
+            // plan = doctor --plan --fast (show diagnosis without auto-applying)
+            await runDoctor(true, true);
             break;
         }
         case "undo": {

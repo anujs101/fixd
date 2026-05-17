@@ -9,21 +9,22 @@ import {
     updateFromScan,
     recordFix,
     summarizeSession,
+    addCausalEntry,
+    recordStackPattern,
     type AppliedFix,
+    type CausalEntry,
 } from "./lib/memory.js";
-import { fixTypescriptNodeTypes } from "../src/actions/fixEnv.js";
 import {
     detectLibrariesInProject,
     fetchDocsForQuery,
     formatDocsForPrompt,
+    scoreDocRelevance,
     type LibraryDoc,
 } from "./lib/context7.js";
-import { exploreProject, diagnoseWithAgent } from "./lib/sub-agents.js";
+import { exploreProject, diagnoseWithAgent, synthesizeDiagnosis } from "./lib/sub-agents.js";
 import { classifyCommand } from "./lib/command-classifier.js";
-
-
 import { scanProject } from "../src/actions/scanFiles.js";
-import { detectIssues, type DetectedIssue } from "../src/actions/fixEnv.js";
+import { fixTypescriptNodeTypes, detectIssues, type DetectedIssue } from "../src/actions/fixEnv.js";
 import { runDiagnostics, formatDiagnosticsForContext, getAllErrors } from "./lib/diagnostics.js";
 import { extractPendingCommands, runCommand, formatResultForAgent } from "./lib/executor.js";
 import {
@@ -217,7 +218,7 @@ function renderDiagnosisResponse(raw: string, knownTypes: Set<string> = new Set(
 
 // ─── Main doctor flow ─────────────────────────────────────────────────────────
 
-export async function runDoctor(cwd?: string, fast = false) {
+export async function runDoctor(cwd?: string, fast = false, plan = false) {
     // Default to cwd; init.ts passes the new project dir explicitly
     // so we never need process.chdir() (which is a global side-effect)
     const projectPath = cwd ?? process.cwd();
@@ -370,19 +371,13 @@ export async function runDoctor(cwd?: string, fast = false) {
             renderDiagnosisResponse(msg.text, knownTypes);
         }
     } else {
-        // ── PARALLEL MODE: explore + diagnose run concurrently ────────────────
-        const [exploreResult, rawDiagnosis] = await Promise.all([
-            exploreProject(projectPath).catch(() => null),
-            diagnoseWithAgent(scanContext, issueList).catch((err: any) => {
-                warn(`Diagnose sub-agent failed: ${err.message}`);
-                return "";
-            }),
-        ]);
-
-        diagSpinner.stop();
+        // ── SEQUENTIAL: explore → diagnose → synthesize (Change 6d) ──────────
+        // exploreProject runs first, its result feeds diagnoseWithAgent
+        const exploreSpinner = spin("exploring project...");
+        const exploreResult = await exploreProject(projectPath).catch(() => null);
+        exploreSpinner.stop();
 
         if (exploreResult) {
-            // Surface any extra context the explorer found
             const extras: string[] = [];
             if (exploreResult.missingEnvVars?.length > 0) {
                 extras.push(`  ${chalk.dim("explorer noted missing env vars:")} ${exploreResult.missingEnvVars.join(", ")}`);
@@ -397,8 +392,40 @@ export async function runDoctor(cwd?: string, fast = false) {
             }
         }
 
+        // diagnoseWithAgent now requires exploreResult — use empty fallback if explore failed
+        const fallbackExplore = exploreResult ?? {
+            framework: null, language: "unknown", runtime: "unknown",
+            packageManager: "unknown", hasTypeScript: false, hasPrisma: false,
+            hasDocker: false, hasTests: false, testFramework: null,
+            entryPoint: null, apiFramework: null, dbProvider: null,
+            missingEnvVars: [], notes: null,
+        };
+
+        const diagnoseSpinner = spin("diagnosing with agent...");
+        const rawDiagnosis = await diagnoseWithAgent(scanContext, issueList, fallbackExplore).catch((err: any) => {
+            warn(`Diagnose sub-agent failed: ${err.message}`);
+            return "";
+        });
+        diagnoseSpinner.stop();
+
+        diagSpinner.stop();
+
         if (rawDiagnosis) {
             renderDiagnosisResponse(rawDiagnosis, knownTypes);
+        }
+
+        // synthesize — Change 6c: wire to section display
+        if (exploreResult && (rawDiagnosis || issues.length > 0)) {
+            const synthSpinner = spin("synthesizing diagnosis...");
+            const synthSummary = await synthesizeDiagnosis(exploreResult, rawDiagnosis, issues).catch(() => "");
+            synthSpinner.stop();
+            if (synthSummary.trim()) {
+                console.log(chalk.dim("── diagnosis summary ───────────────────"));
+                for (const line of synthSummary.split("\n")) {
+                    if (line.trim()) console.log(`  ${chalk.dim("│")} ${line}`);
+                }
+                console.log();
+            }
         }
     }
 
@@ -540,7 +567,8 @@ export async function runDoctor(cwd?: string, fast = false) {
         if (["exit", "quit", "q", ":q"].includes(input.toLowerCase())) break;
 
         sessionLog.push(`you: ${input}`);
-        await agenticTurn(input, projectPath, 0, new Set(), projectLibraries, sessionLog, sessionChangedFiles);
+        const state = makeSessionState();
+        await agenticTurn(input, projectPath, 0, state, new Set(), projectLibraries, sessionLog, sessionChangedFiles, issues);
     }
     closePrompt();
 
@@ -552,75 +580,181 @@ export async function runDoctor(cwd?: string, fast = false) {
     disconnect();
 }
 
-// ─── Agentic execution loop ────────────────────────────────────────────────────────────────────
+// ─── SessionState ──────────────────────────────────────────────────────────────────────────────
+
+interface Hypothesis {
+    claim: string;           // first line of agent response
+    fix: string;             // file path patched or command run
+    outcome: "resolved" | "no_change" | "regression" | "pending";
+    issuesBefore: number;
+    issuesAfter: number;
+    timestamp: string;
+}
+
+interface SessionState {
+    hypotheses: Hypothesis[];
+    triedFixes: Set<string>;  // "filepath::searchString" keys
+    currentDepth: number;
+    totalFixAttempts: number;
+    startTime: string;
+}
+
+function makeSessionState(): SessionState {
+    return {
+        hypotheses: [],
+        triedFixes: new Set(),
+        currentDepth: 0,
+        totalFixAttempts: 0,
+        startTime: new Date().toISOString(),
+    };
+}
+
+function formatHypothesesBlock(hypotheses: Hypothesis[]): string {
+    if (hypotheses.length === 0) return "";
+    const lines = [
+        "--- SESSION HYPOTHESES ---",
+        ...hypotheses.map((h, i) =>
+            `${i + 1}. ${h.claim} → fixed: ${h.fix} → ${h.outcome}`
+        ),
+        "--- END SESSION HYPOTHESES ---",
+    ];
+    return lines.join("\n");
+}
+
+function getErrorTypeFormatInstruction(userMessage: string, detectedIssues: DetectedIssue[]): string {
+    const issueTypes = detectedIssues.map((i) => i.type);
+
+    if (issueTypes.includes("MISSING_DATABASE_URL") || issueTypes.includes("PRISMA_POOLED_WITHOUT_DIRECT_URL")) {
+        return "FORMAT: Output ONLY <<<WRITE: .env>>> or <<<EDIT: prisma/schema.prisma>>> patch markers. Zero prose. Zero explanation.";
+    }
+    if (issueTypes.includes("PORT_CONFLICT")) {
+        return "FORMAT: Output ONLY a ```bash block with the kill command. Zero prose.";
+    }
+    if (issueTypes.includes("MISSING_NODE_TYPES") || issueTypes.includes("TSCONFIG_STRICT_MISSING")) {
+        return "FORMAT: Output ONLY <<<EDIT: tsconfig.json>>> patch marker. Zero prose.";
+    }
+    if (/typescript|ts error|type error/i.test(userMessage)) {
+        return "FORMAT: Output ONLY <<<EDIT: filepath>>> patch markers with exact SEARCH/REPLACE blocks. One block per error location. Zero prose.";
+    }
+    if (/fix|apply|implement|create|add|remove|update|change|patch|edit/i.test(userMessage)) {
+        return "EXECUTE DON'T EXPLAIN: output patch markers or bash blocks immediately. No preamble. No explanation. No summary.";
+    }
+    return "RESPOND FORMAT: max 4 lines. Answer directly. No preamble.";
+}
+
+function generateStuckReport(state: SessionState, remainingIssues: DetectedIssue[]): string {
+    const elapsed = Math.round((Date.now() - new Date(state.startTime).getTime()) / 1000);
+    const lines: string[] = [
+        "## Auto-fix limit reached\n",
+        `**Attempts made:** ${state.totalFixAttempts}`,
+        `**Session duration:** ${elapsed}s`,
+        "",
+        "### What was tried:",
+    ];
+    state.hypotheses.forEach((h, i) => {
+        lines.push(`${i + 1}. ${h.claim}`);
+        lines.push(`   → fix: \`${h.fix}\` → **${h.outcome}**`);
+    });
+    lines.push("", "### Remaining issues:");
+    remainingIssues.forEach((issue) => {
+        const msg = "description" in issue ? (issue as any).description : (issue as any).message ?? "";
+        lines.push(`- **${issue.type}** (${issue.severity}): ${msg}`);
+    });
+    lines.push("", "### Recommended manual steps:");
+    lines.push("Review the issues above and the fix attempts. The agent was unable to resolve these automatically.");
+    lines.push("Consider: checking environment variable configuration, reviewing schema files manually, or running `fixd doctor --fast` for a fresh analysis.");
+    return lines.join("\n");
+}
+
+// ─── Agentic execution loop ───────────────────────────────────────────────────
 //
-// One "turn" = send message → agent responds → if agent proposed commands,
-// show approval prompts → run approved ones → feed output back into a new turn.
-// Loops until the agent stops proposing commands (max 6 tool calls to prevent runaway).
+// One "turn" = send message → agent responds → patches/commands → recurse.
+// Now driven by SessionState for hypothesis tracking, duplicate detection,
+// and outcome-based routing. Max depth 6.
+
+async function computeFixOutcome(
+    projectRoot: string,
+    issuesBefore: DetectedIssue[]
+): Promise<{ outcome: "resolved" | "no_change" | "regression"; delta: number; newIssues: DetectedIssue[] }> {
+    const [newScan, newDiag] = await Promise.all([
+        scanProject(projectRoot).catch(() => null),
+        runDiagnostics(projectRoot).catch(() => []),
+    ]);
+    const newIssues = newScan ? detectIssues(newScan, projectRoot) : issuesBefore;
+    const diagErrs  = getAllErrors(newDiag);
+    const before = issuesBefore.length;
+    const after  = newIssues.length + diagErrs.length;
+    const delta  = before - after;
+    const outcome: "resolved" | "no_change" | "regression" =
+        delta > 0 ? "resolved" : delta < 0 ? "regression" : "no_change";
+    return { outcome, delta, newIssues };
+}
 
 async function agenticTurn(
     userMessage: string,
-    projectPath: string,
-    depth = 0,
-    alreadyRan: Set<string> = new Set(),
-    projectLibraries: string[] = [],
-    sessionLog: string[] = [],
-    sessionChangedFiles: string[] = []
+    projectRoot: string,
+    depth: number,
+    state: SessionState,
+    alreadyRan: Set<string>,
+    projectLibraries: string[],
+    sessionLog: string[],
+    sessionChangedFiles: string[],
+    detectedIssues: DetectedIssue[] = []
 ): Promise<void> {
-    const MAX_DEPTH = 6;
-    // A3: was `depth > MAX_DEPTH` which allowed 7 turns — now correctly stops at 6
-    if (depth >= MAX_DEPTH) {
-        info("(max tool calls reached for this turn)");
+    state.currentDepth = depth;
+
+    // Change 4b: at depth >= 6, generate stuck report instead of silently stopping
+    if (depth >= 6) {
+        const stuckReport = generateStuckReport(state, detectedIssues);
+        section("FIXD Could Not Fully Resolve");
+        agentSays(stuckReport);
         return;
     }
 
-    // ── READ FILES before every top-level turn (depth 0 only) ────────────────
+    // Change 4a: depth 4 pressure message
+    if (depth === 4) {
+        const pressure = `[SESSION PRESSURE: 2 attempts remaining. You have tried ${state.totalFixAttempts} fixes. Prioritize the highest-confidence fix for the most impactful remaining issue. Make ONE surgical, targeted fix only.]`;
+        userMessage = pressure + "\n" + userMessage;
+    }
+
+    // ── Hypothesis block prepend on depth > 0 ────────────────────────────────
+    if (depth > 0 && state.hypotheses.length > 0) {
+        userMessage = formatHypothesesBlock(state.hypotheses) + "\n\n" + userMessage;
+    }
+
+    // ── READ FILES (depth 0 only) — Change 7: pass issueTypes ────────────────
     let fileContext = "";
     if (depth === 0) {
         const readSpinner = spin("reading project files...");
-        fileContext = await readRelevantFiles(userMessage, projectPath).catch(() => "");
+        const issueTypes = detectedIssues.map((i) => i.type);
+        fileContext = await readRelevantFiles(userMessage, projectRoot, issueTypes).catch(() => "");
         readSpinner.stop();
     }
 
-    // ── Pick format instructions based on intent ──────────────────────────────
-    const isFixRequest = /\b(fix|apply|implement|create|add|remove|update|change|patch|edit)\b/i.test(userMessage);
+    // ── Per-error-type format instructions (Change 3) ─────────────────────────
+    const formatInstruction = getErrorTypeFormatInstruction(userMessage, detectedIssues);
+    const isFixRequest = /fix|apply|implement|create|add|remove|update|change|patch|edit/i.test(userMessage);
 
-    const formatInstructions = isFixRequest
-        ? [
-            "",
-            "",
-            "EXECUTE DON'T EXPLAIN:",
-            "- If fixing a file: output patch markers immediately, no preamble",
-            "- If running a command: output bash block immediately",
-            "- Do not describe what you will do — just do it",
-            "- After patch markers: one sentence max explaining what changed",
-        ].join("\n")
-        : [
-            "",
-            "",
-            "RESPOND FORMAT:",
-            "- Answer directly from file contents above",
-            "- Max 4 lines unless showing code",
-            "- If showing code: use fenced blocks with language tag",
-            '- No "I will", "Let me", "Sure" openers',
-            "- Start answer immediately",
-        ].join("\n");
-
-    // ── Build enriched message (file context + docs + format rules) ───────────
+    // ── Build enriched message ────────────────────────────────────────────────
     const parts: string[] = [];
     if (fileContext) parts.push(fileContext);
-    parts.push(`[Working directory: ${projectPath}]`);
+    parts.push(`[Working directory: ${projectRoot}]`);
     parts.push("");
-    parts.push(userMessage + formatInstructions);
-
+    parts.push(userMessage);
+    parts.push("");
+    parts.push(formatInstruction);
     let enrichedMessage = parts.filter(Boolean).join("\n");
 
-    // Inject live library docs for depth-0 turns
+    // ── Relevance-gated Context7 (depth 0 only) ───────────────────────────────
     if (depth === 0) {
-        const docs: LibraryDoc[] = await fetchDocsForQuery(userMessage, projectLibraries).catch(() => []);
-        if (docs.length > 0) {
-            const docsContext = formatDocsForPrompt(docs);
-            enrichedMessage = `${docsContext}\n\n${enrichedMessage}`;
+        const relevantLibIds = await scoreDocRelevance(userMessage, projectLibraries).catch(() => projectLibraries);
+        if (relevantLibIds.length === 0) {
+            info("No library docs needed for this query");
+        } else {
+            const docs: LibraryDoc[] = await fetchDocsForQuery(userMessage, relevantLibIds).catch(() => []);
+            if (docs.length > 0) {
+                enrichedMessage = `${formatDocsForPrompt(docs)}\n\n${enrichedMessage}`;
+            }
         }
     }
 
@@ -631,37 +765,120 @@ async function agenticTurn(
         warn(err.message);
         return [];
     });
-
     thinkSpinner.stop();
 
     for (const msg of responses) {
-        // strip any residual think blocks before display
         const clean = msg.text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
         agentSays(clean);
         if (depth === 0) sessionLog.push(`agent: ${clean}`);
 
-        // ── Propose and apply any file patches the agent emitted ────────────────
-        const patches = await proposeAndApply(clean, projectPath, { confirmEach: true });
-        const applied = patches.filter((p) => p.applied);
-        if (applied.length > 0) {
-            // Track changed files for session memory
-            for (const p of applied) sessionChangedFiles.push(p.path);
-            // Feed applied changes back so the agent has accurate context
+        // ── Duplicate patch detection (Change 1e) ─────────────────────────────
+        const editBlocks = [...clean.matchAll(/<<<EDIT:\s*([^>]+)>>>([\s\S]*?)<<<END>>>/g)];
+        const skipKeys = new Set<string>();
+        for (const [, filePath, body] of editBlocks) {
+            const searchMatch = body.match(/<<<SEARCH>>>([\s\S]*?)<<<REPLACE>>>/);
+            if (searchMatch) {
+                const key = `${filePath.trim()}::${searchMatch[1].trim().slice(0, 100)}`;
+                if (state.triedFixes.has(key)) {
+                    skipKeys.add(key);
+                }
+            }
+        }
+        if (skipKeys.size > 0) {
             await agenticTurn(
-                `Applied ${applied.length} file change(s):\n${applied.map((p) => `- ${p.op} ${p.path}`).join("\n")}\n\nVerify the changes are correct and continue.`,
-                projectPath,
-                depth + 1,
-                alreadyRan,
-                projectLibraries,
-                sessionLog,
-                sessionChangedFiles
+                "[Skipped: identical fix already attempted for this location. Try a different approach.]",
+                projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues
             );
-            return; // agent will continue the turn above
+            return;
         }
 
-        // ── Detect shell commands the agent wants to run ────────────────────────
-        // A5: Strip patch marker blocks first to prevent shell lines inside
-        // <<<WRITE: Makefile>>> from being double-extracted as pending commands.
+        // ── Capture before-state for outcome tracking ─────────────────────────
+        const issuesBefore = [...detectedIssues];
+
+        // ── Propose and apply patches ─────────────────────────────────────────
+        const patches = await proposeAndApply(clean, projectRoot, { confirmEach: true });
+        const applied = patches.filter((p) => p.applied);
+
+        if (applied.length > 0) {
+            state.totalFixAttempts++;
+            for (const p of applied) sessionChangedFiles.push(p.path);
+
+            // Register triedFixes keys for duplicate detection
+            for (const [, filePath, body] of editBlocks) {
+                const searchMatch = body.match(/<<<SEARCH>>>([\s\S]*?)<<<REPLACE>>>/);
+                if (searchMatch) {
+                    state.triedFixes.add(`${filePath.trim()}::${searchMatch[1].trim().slice(0, 100)}`);
+                }
+            }
+
+            // Compute fix outcome (Change 2a/b)
+            const { outcome, delta, newIssues } = await computeFixOutcome(projectRoot, issuesBefore);
+
+            // Extract hypothesis from first non-empty line of agent response
+            const claim = clean.split("\n").find((l) => l.trim()) ?? "(no hypothesis)";
+            const fixPath = applied.map((p) => p.path).join(", ");
+
+            // Update hypothesis entry (Change 1c/2d)
+            const hypo: Hypothesis = {
+                claim:        claim.slice(0, 100),
+                fix:          fixPath,
+                outcome,
+                issuesBefore: issuesBefore.length,
+                issuesAfter:  newIssues.length,
+                timestamp:    new Date().toISOString(),
+            };
+            state.hypotheses.push(hypo);
+
+            // Write causal entry + stack pattern to memory
+            const followupIssues = newIssues
+                .filter((a) => !issuesBefore.some((b) => b.type === a.type))
+                .map((i) => i.type);
+
+            const mem = await loadMemory(projectRoot).catch(() => null);
+            if (mem) {
+                for (const p of applied) {
+                    const causalEntry: CausalEntry = {
+                        timestamp:     new Date().toISOString(),
+                        file:          p.path,
+                        issueType:     issuesBefore[0]?.type ?? "UNKNOWN",
+                        action:        claim.slice(0, 120),
+                        outcome:       outcome === "resolved" ? "resolved" : outcome === "regression" ? "regression" : "no_change",
+                        followupIssues,
+                    };
+                    const withCausal = addCausalEntry(mem, causalEntry);
+                    // Change 5e: record stack pattern
+                    const withPattern = recordStackPattern(
+                        withCausal,
+                        mem.knownStack,
+                        issuesBefore[0]?.type ?? "UNKNOWN",
+                        claim.slice(0, 120),
+                        outcome === "resolved" ? "success" : "failure"
+                    );
+                    await saveMemory(withPattern).catch(() => {});
+                }
+            }
+
+            // Change 2c: outcome-based routing
+            if (outcome === "resolved") {
+                const msg = `[Fix Outcome: FIXED — ${Math.abs(delta)} issue(s) resolved]\nApplied ${applied.length} change(s), verify remaining issues.`;
+                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues);
+            } else if (outcome === "no_change") {
+                const hypoLog = formatHypothesesBlock(state.hypotheses);
+                const msg = `[Fix Outcome: NO CHANGE — fix had no effect]\n${hypoLog}\nThe previous fix had no effect. Review the hypothesis log above. Form a completely different hypothesis and try again, or explain why this cannot be fixed automatically.`;
+                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues);
+            } else {
+                const newIssueList = newIssues
+                    .filter((a) => !issuesBefore.some((b) => b.type === a.type))
+                    .map((i) => `  - ${i.type}: ${"description" in i ? (i as any).description : ""}`)
+                    .join("\n");
+                const hypoLog = formatHypothesesBlock(state.hypotheses);
+                const msg = `[Fix Outcome: REGRESSION — ${Math.abs(delta)} new issue(s) introduced]\nNew issues:\n${newIssueList}\n${hypoLog}\nThe fix made things worse. Reassess completely.`;
+                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues);
+            }
+            return;
+        }
+
+        // ── Shell commands ────────────────────────────────────────────────────
         const textWithoutPatches = clean
             .replace(/<<<WRITE:.*?<<<END>>>/gs, "")
             .replace(/<<<EDIT:.*?<<<END>>>/gs, "")
@@ -669,57 +886,39 @@ async function agenticTurn(
             .replace(/<<<RENAME:[^\n>]+>>>/g, "");
         const pending = extractPendingCommands(textWithoutPatches, alreadyRan);
 
-        // ── Auto-run or confirm each pending command ──────────────────────────
         for (const cmd of pending) {
             alreadyRan.add(cmd.command);
 
-            // Classify: fast path (no LLM) or LLM for ambiguous commands
             const classifySpinner = depth === 0 ? spin("classifying command...") : null;
             const classification = await classifyCommand(cmd.command).catch(() => ({ classification: "confirm" as const, reason: "llm-error" as const }));
             classifySpinner?.stop();
 
             if (classification.classification === "auto-run") {
-                // Auto-run silently — show a dim indicator but no prompt
                 console.log(`  ${chalk.dim("●")} ${chalk.dim("auto-running:")} ${chalk.white(cmd.command)}`);
-
                 const runSpinner = spin(`running: ${chalk.bold(cmd.command)}`);
-                const result = await runCommand(cmd.command, projectPath);
+                const result = await runCommand(cmd.command, projectRoot);
                 runSpinner.stop();
-
-                if (result.exitCode !== 0) {
-                    // Failed auto-run: show result and continue with agent
-                    printCommandResult(result);
-                }
-
-                await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles);
+                if (result.exitCode !== 0) printCommandResult(result);
+                await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues);
                 continue;
             }
 
-            // confirm path — human approval
-            agentWantsToRun(cmd.command, cmd.reason, projectPath);
-
-            const approved = await confirm(`run this command?`);
+            agentWantsToRun(cmd.command, cmd.reason, projectRoot);
+            const approved = await confirm("run this command?");
 
             if (!approved) {
                 await agenticTurn(
                     `[User declined to run: \`${cmd.command}\`]. Propose alternative or explain manual steps.`,
-                    projectPath,
-                    depth + 1,
-                    alreadyRan,
-                    projectLibraries,
-                    sessionLog,
-                    sessionChangedFiles
+                    projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues
                 );
                 continue;
             }
 
             const runSpinner = spin(`running: ${chalk.bold(cmd.command)}`);
-            const result = await runCommand(cmd.command, projectPath);
+            const result = await runCommand(cmd.command, projectRoot);
             runSpinner.stop();
-
             printCommandResult(result);
-
-            await agenticTurn(formatResultForAgent(result), projectPath, depth + 1, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles);
+            await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues);
         }
     }
 }

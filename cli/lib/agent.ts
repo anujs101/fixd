@@ -2,7 +2,7 @@
 // Wraps llm.ts with session history management and character-derived system prompt.
 // Drop-in replacement for the old Socket.IO client.ts
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { chat, ask, type Message, type Task } from "./llm.js";
@@ -44,21 +44,14 @@ RULES:
 
 function loadSystemPrompt(): string {
     try {
-        // Resolve relative to this file's location: cli/lib/ → ../../characters/
         const here = path.dirname(fileURLToPath(import.meta.url));
         const characterPath = path.resolve(here, "../../characters/agent.character.json");
         const raw = readFileSync(characterPath, "utf-8");
         const char = JSON.parse(raw);
 
         const parts: string[] = [];
-
-        if (char.system) {
-            parts.push(char.system);
-        }
-
-        if (Array.isArray(char.bio) && char.bio.length > 0) {
-            parts.push("\n" + char.bio.join(" "));
-        }
+        if (char.system) parts.push(char.system);
+        if (Array.isArray(char.bio) && char.bio.length > 0) parts.push("\n" + char.bio.join(" "));
 
         const styleRules: string[] = [
             ...(char.style?.all ?? []),
@@ -68,13 +61,26 @@ function loadSystemPrompt(): string {
             parts.push("\nSTYLE RULES:\n" + styleRules.map((r: string) => `- ${r}`).join("\n"));
         }
 
-        // Append patch marker instructions
         parts.push(PATCH_INSTRUCTIONS);
-
         return parts.join("\n");
     } catch {
-        // Fallback if character file not found
         return "You are fixd, a terminal-native dev environment agent. Be terse and technical." + PATCH_INSTRUCTIONS;
+    }
+}
+
+/**
+ * Read FIXD.md from the project root if it exists.
+ * Returns a formatted block ready for prepending to the system prompt.
+ */
+function loadFixdMd(projectPath: string): string {
+    try {
+        const fixdMdPath = path.join(projectPath, "FIXD.md");
+        if (!existsSync(fixdMdPath)) return "";
+        const content = readFileSync(fixdMdPath, "utf-8").trim();
+        if (!content) return "";
+        return `[PROJECT CONTEXT — from FIXD.md]\n${content}\n[END FIXD.md]`;
+    } catch {
+        return "";
     }
 }
 
@@ -143,9 +149,19 @@ export async function sendMessage(
         _memoryCache = { projectPath: projPath, memory };
     }
     const memoryContext = formatMemoryForPrompt(memory);
-    const fullSystemPrompt = memoryContext
-        ? `${memoryContext}\n\n${SYSTEM_PROMPT}`
-        : SYSTEM_PROMPT;
+
+    // Prepend FIXD.md context if it exists in the active project
+    // This gives the agent stack awareness from the first message with no extra LLM call
+    const fixdMdContext = loadFixdMd(projPath);
+
+    // Upgrade 5: static hypothesis rule — always injected so the agent knows
+    // not to repeat a fix that was already marked NO CHANGE or REGRESSION.
+    const HYPOTHESIS_RULE =
+        "\nAGENT RULE: If a previously attempted fix appears in the session hypotheses " +
+        "marked NO CHANGE or REGRESSION, do not attempt the same fix again. Form a new hypothesis.\n";
+
+    const fullSystemPrompt = [fixdMdContext, memoryContext, SYSTEM_PROMPT + HYPOTHESIS_RULE]
+        .filter(Boolean).join("\n\n");
 
     // Build full message array: system + history (capped by token budget)
     const trimmed = trimHistoryByTokens(history);

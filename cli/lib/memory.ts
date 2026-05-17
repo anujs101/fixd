@@ -7,6 +7,25 @@ import { ask } from "./llm.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+export interface CausalEntry {
+    timestamp: string;
+    file: string;           // which file was changed
+    issueType: string;      // e.g. "PRISMA_POOLED_WITHOUT_DIRECT_URL"
+    action: string;         // what the agent did (1 sentence)
+    outcome: "resolved" | "no_change" | "regression";
+    followupIssues: string[]; // any new issues that appeared after
+}
+
+export interface StackPattern {
+    stack: string;              // e.g. "Next.js+Prisma+PostgreSQL"
+    issueType: string;          // e.g. "PRISMA_POOLED_WITHOUT_DIRECT_URL"
+    fixDescription: string;     // e.g. "added DIRECT_URL to .env and directUrl to schema"
+    outcome: "success" | "failure";
+    confidence: number;         // 0-1, increases with repeated success
+    seenCount: number;
+    lastSeen: string;
+}
+
 export interface ProjectMemory {
     projectRoot: string;
     lastScanned: string | null;
@@ -14,6 +33,8 @@ export interface ProjectMemory {
     knownStack: Partial<StackSnapshot>;
     chatSummaries: ChatSummary[];
     userPreferences: Record<string, string>;
+    causalChain: CausalEntry[];
+    stackPatterns: StackPattern[];  // capped at 50
 }
 
 interface FixedIssue {
@@ -58,8 +79,10 @@ interface ScanLike {
 
 const MEMORY_DIR      = ".fixd";
 const MEMORY_FILENAME = "memory.json";
-const MAX_FIXED_ISSUES   = 50;
-const MAX_CHAT_SUMMARIES = 10;
+const MAX_FIXED_ISSUES    = 50;
+const MAX_CHAT_SUMMARIES  = 10;
+const MAX_CAUSAL_ENTRIES  = 30;
+const MAX_STACK_PATTERNS  = 50;
 
 // ─── Dep-pattern maps ─────────────────────────────────────────────────────────
 
@@ -91,7 +114,16 @@ function detectFromDeps(deps: string[], map: Record<string, string>): string[] {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function emptyMemory(projectRoot: string): ProjectMemory {
-    return { projectRoot, lastScanned: null, fixedIssues: [], knownStack: {}, chatSummaries: [], userPreferences: {} };
+    return {
+        projectRoot,
+        lastScanned: null,
+        fixedIssues: [],
+        knownStack: {},
+        chatSummaries: [],
+        userPreferences: {},
+        causalChain: [],
+        stackPatterns: [],
+    };
 }
 
 function memoryFilePath(projectRoot: string): string {
@@ -104,6 +136,7 @@ function memoryFilePath(projectRoot: string): string {
 export async function loadMemory(projectRoot: string): Promise<ProjectMemory> {
     try {
         const raw = await fs.readFile(memoryFilePath(projectRoot), "utf-8");
+        // Safe migration: old schema without causalChain gets [] default from emptyMemory
         return { ...emptyMemory(projectRoot), ...JSON.parse(raw) };
     } catch {
         return emptyMemory(projectRoot);
@@ -127,7 +160,7 @@ export async function saveMemory(memory: ProjectMemory): Promise<void> {
         await fs.writeFile(tmp, JSON.stringify(memory, null, 2), "utf-8");
         await fs.rename(tmp, fp);
     } catch (err: any) {
-        // B4: non-fatal but visible — user should know if history won’t persist
+        // B4: non-fatal but visible — user should know if history won't persist
         console.error(`\n  ⚠ fixd: could not save session memory — ${(err as Error).message ?? "disk error"}`);
     }
 }
@@ -172,6 +205,70 @@ export function recordFix(memory: ProjectMemory, fixes: AppliedFix[]): ProjectMe
     return { ...memory, fixedIssues };
 }
 
+/**
+ * Append a causal entry to the chain (capped at 30). Caller saves.
+ * Safe even if causalChain is undefined (old schema).
+ */
+export function addCausalEntry(memory: ProjectMemory, entry: CausalEntry): ProjectMemory {
+    const existing = memory.causalChain ?? [];
+    const causalChain = [...existing, entry].slice(-MAX_CAUSAL_ENTRIES);
+    return { ...memory, causalChain };
+}
+
+/**
+ * Record a stack pattern — what fix works (or fails) for a given stack+issueType.
+ * Updates confidence in place if the pattern already exists.
+ * Safe even if stackPatterns is undefined (old schema).
+ */
+export function recordStackPattern(
+    memory: ProjectMemory,
+    stack: Partial<StackSnapshot>,
+    issueType: string,
+    fixDescription: string,
+    outcome: "success" | "failure"
+): ProjectMemory {
+    const stackKey = [
+        stack.frameworks?.join("+") || "unknown",
+        stack.databases?.join("+") || "",
+        stack.orms?.join("+") || "",
+    ].filter(Boolean).join("+");
+
+    const patterns: StackPattern[] = memory.stackPatterns ? [...memory.stackPatterns] : [];
+    const idx = patterns.findIndex(
+        (p) => p.stack === stackKey && p.issueType === issueType
+    );
+
+    if (idx >= 0) {
+        const existing = { ...patterns[idx] };
+        existing.seenCount++;
+        existing.lastSeen = new Date().toISOString();
+        if (outcome === "success") {
+            existing.confidence = Math.min(1, existing.confidence + 0.15);
+            existing.outcome = "success";
+        } else {
+            existing.confidence = Math.max(0, existing.confidence - 0.1);
+        }
+        patterns[idx] = existing;
+    } else {
+        patterns.push({
+            stack:           stackKey,
+            issueType,
+            fixDescription,
+            outcome,
+            confidence:      outcome === "success" ? 0.6 : 0.3,
+            seenCount:       1,
+            lastSeen:        new Date().toISOString(),
+        });
+    }
+
+    // Cap at 50, keep highest confidence
+    const trimmed = patterns
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, MAX_STACK_PATTERNS);
+
+    return { ...memory, stackPatterns: trimmed };
+}
+
 /** Ask LLM for a 2-sentence session summary and append to chatSummaries.
  *  changedFiles — list of relative file paths patched during the session (fix 8.1). */
 export async function summarizeSession(
@@ -202,10 +299,12 @@ export async function summarizeSession(
 
 /** Format memory as a prompt prefix. Returns empty string if memory is blank. */
 export function formatMemoryForPrompt(memory: ProjectMemory): string {
+    const chain = memory.causalChain ?? [];
     const hasContent =
         memory.lastScanned ||
         memory.fixedIssues.length > 0 ||
-        memory.chatSummaries.length > 0;
+        memory.chatSummaries.length > 0 ||
+        chain.length > 0;
 
     if (!hasContent) return "";
 
@@ -236,6 +335,36 @@ export function formatMemoryForPrompt(memory: ProjectMemory): string {
             const date = new Date(s.sessionDate).toLocaleDateString();
             lines.push(`- ${date}: ${s.summary}`);
         }
+    }
+
+    // ─── Causal history ───────────────────────────────────────────────────────
+    if (chain.length > 0) {
+        lines.push("");
+        lines.push("--- CAUSAL HISTORY ---");
+        for (const entry of chain.slice(-10)) {
+            const date = new Date(entry.timestamp).toLocaleDateString();
+            const followup = entry.followupIssues.length > 0
+                ? ` → followup: ${entry.followupIssues.join(", ")}`
+                : "";
+            lines.push(
+                `[${date}] ${entry.file} | ${entry.issueType} → ${entry.action} → ${entry.outcome}${followup}`
+            );
+        }
+        lines.push("--- END CAUSAL HISTORY ---");
+    }
+
+    // ─── Stack patterns ───────────────────────────────────────────────────────
+    const patterns = memory.stackPatterns ?? [];
+    const relevantPatterns = patterns.filter((p) => p.confidence > 0.5).slice(0, 5);
+    if (relevantPatterns.length > 0) {
+        lines.push("");
+        lines.push("--- STACK PATTERNS (proven fixes for this type of project) ---");
+        for (const p of relevantPatterns) {
+            lines.push(
+                `[${p.stack}] ${p.issueType} → "${p.fixDescription}" (confidence: ${(p.confidence * 100).toFixed(0)}%, seen ${p.seenCount}x)`
+            );
+        }
+        lines.push("--- END STACK PATTERNS ---");
     }
 
     lines.push("--- END MEMORY ---");
