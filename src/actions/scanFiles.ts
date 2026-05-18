@@ -10,6 +10,12 @@ export interface PortInfo {
     process: string;
 }
 
+export interface DockerPort {
+    service: string;
+    hostPort: number;
+    containerPort: number;
+}
+
 export interface PrismaInfo {
     found: boolean;
     provider: string | null;
@@ -31,6 +37,7 @@ export interface ProjectScan {
     env: EnvInfo;
     prisma: PrismaInfo;
     dockerCompose: Record<string, any> | null;
+    dockerPorts: DockerPort[];      // parsed host→container port mappings
     runningPorts: PortInfo[];
     nodeVersion: string | null;
     bunVersion: string | null;
@@ -142,6 +149,40 @@ function detectPackageManager(
     return "unknown";
 }
 
+/**
+ * Extracts host→container port bindings from a raw docker-compose YAML string.
+ * Uses regex (no js-yaml dep) to find:
+ *   - "HOST:CONTAINER" or 'HOST:CONTAINER'
+ *   - - "HOST:CONTAINER"  (list form)
+ * Returns an array of { service, hostPort, containerPort }.
+ */
+function parseDockerComposePorts(raw: string): DockerPort[] {
+    const ports: DockerPort[] = [];
+    const lines = raw.split("\n");
+
+    let currentService = "unknown";
+
+    for (const line of lines) {
+        // Detect service name: top-level 2-space or 4-space indented key under `services:`
+        const serviceMatch = line.match(/^  ([a-zA-Z0-9_-]+)\s*:/);
+        if (serviceMatch) {
+            currentService = serviceMatch[1];
+        }
+
+        // Match port bindings: - "HOST:CONTAINER" or - HOST:CONTAINER
+        const portMatch = line.match(/[-\s]+["']?(\d+):(\d+)["']?/);
+        if (portMatch) {
+            const hostPort      = parseInt(portMatch[1], 10);
+            const containerPort = parseInt(portMatch[2], 10);
+            if (!isNaN(hostPort) && !isNaN(containerPort)) {
+                ports.push({ service: currentService, hostPort, containerPort });
+            }
+        }
+    }
+
+    return ports;
+}
+
 // ─── Main scanner ─────────────────────────────────────────────────────────────
 
 /**
@@ -211,15 +252,11 @@ export async function scanProject(projectPath: string): Promise<ProjectScan> {
 
     // ── Parse docker-compose ───────────────────────────────────────────────────
     let dockerCompose: Record<string, any> | null = null;
+    let dockerPorts: DockerPort[] = [];
     const dockerComposeRaw = dockerComposeYml ?? dockerComposeYaml;
     if (dockerComposeRaw) {
-        try {
-            // Basic YAML parse — avoid heavy deps, just extract key info as text
-            // Full YAML parsing would require js-yaml; keep it lightweight for now
-            dockerCompose = { raw: dockerComposeRaw };
-        } catch {
-            errors.push("Failed to parse docker-compose file");
-        }
+        dockerCompose = { raw: dockerComposeRaw };
+        dockerPorts   = parseDockerComposePorts(dockerComposeRaw);
     }
 
     // ── Scan running ports ─────────────────────────────────────────────────────
@@ -252,6 +289,7 @@ export async function scanProject(projectPath: string): Promise<ProjectScan> {
         },
         prisma: prismaInfo,
         dockerCompose,
+        dockerPorts,
         runningPorts,
         nodeVersion,
         bunVersion,

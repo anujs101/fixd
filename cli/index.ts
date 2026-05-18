@@ -24,7 +24,9 @@ import {
 } from "./lib/display.js";
 import { SMALL_MODEL, LARGE_MODEL } from "./lib/llm.js";
 
-const VERSION = "0.3.0"; // keep in sync with package.json
+import { readFileSync } from "node:fs";
+const _pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as { version: string };
+const VERSION = _pkg.version; // always in sync with package.json
 
 // ─── Help text ────────────────────────────────────────────────────────────────
 
@@ -44,7 +46,7 @@ function printHelp() {
         `    ${chalk.cyan("fixd doctor --plan")}   ${chalk.dim("show diagnosis and fix plan before applying any changes")}`
     );
     console.log(
-        `    ${chalk.cyan("fixd plan")}            ${chalk.dim("alias for: fixd doctor --plan --fast")}`
+        `    ${chalk.cyan("fixd plan")}            ${chalk.dim("diagnose project, preview fix plan, confirm before applying anything")}`
     );
     console.log(
         `    ${chalk.cyan("fixd init")}            ${chalk.dim("scaffold a new project from scratch")}`

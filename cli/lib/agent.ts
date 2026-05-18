@@ -184,6 +184,15 @@ export function resetSession(): void {
     _memoryCache = null; // also clear memory cache when session resets
 }
 
+// ─── primeContext — inject text into history without an LLM call ──────────────
+// Used to seed the agent with e.g. the synthesis summary so it is context-aware
+// from the first user message without paying for an extra LLM round-trip.
+
+export function primeContext(text: string): void {
+    if (!text?.trim()) return;
+    history.push({ role: "assistant", content: text });
+}
+
 // ─── checkHealth — verify GROQ_API_KEY + reachability ────────────────────────
 
 export async function checkHealth(): Promise<boolean> {

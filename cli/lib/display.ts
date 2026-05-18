@@ -47,6 +47,18 @@ export function stopSpin() {
     activeSpinner = null;
 }
 
+// ─── SIGINT handler — clean exit on Ctrl+C ────────────────────────────────────
+// Without this, ora leaves the cursor hidden and the terminal line dirty when
+// the user interrupts a running spinner or readline prompt.
+
+process.once("SIGINT", () => {
+    stopSpin();
+    // Close readline if it exists (lazy import to avoid circular reference)
+    try { rl?.close(); } catch { /* rl may not be initialised yet */ }
+    console.log(); // move to a clean line
+    process.exit(0);
+});
+
 // ─── Header ───────────────────────────────────────────────────────────────────
 
 export function printHeader(command: string) {

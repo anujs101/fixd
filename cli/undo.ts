@@ -74,9 +74,22 @@ export async function runUndo() {
     let restored = 0;
     let failed   = 0;
 
+    const projectRoot = path.resolve(projectPath); // canonical form
+
     for (const backupAbs of backedUpFiles) {
         const rel    = path.relative(backupDir, backupAbs);
         const target = path.join(projectPath, rel);
+
+        // ── Path traversal guard ───────────────────────────────────────────────
+        // Resolve to an absolute path and check it stays within the project root.
+        // A tampered .fixd/last-backup file could otherwise write files anywhere.
+        const targetResolved = path.resolve(target);
+        if (targetResolved !== projectRoot && !targetResolved.startsWith(projectRoot + path.sep)) {
+            warn(`skipping suspicious path outside project root: ${rel}`);
+            failed++;
+            continue;
+        }
+
         try {
             await fs.mkdir(path.dirname(target), { recursive: true });
             await fs.copyFile(backupAbs, target);

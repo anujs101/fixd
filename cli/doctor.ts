@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import path from "node:path";
-import { sendMessage, disconnect, setActiveProject } from "./lib/agent.js";
+import { sendMessage, disconnect, setActiveProject, primeContext } from "./lib/agent.js";
 import { proposeAndApply, resetBackupSession } from "./lib/patcher.js";
 import { readRelevantFiles } from "./lib/projectReader.js";
 import {
@@ -102,6 +102,15 @@ function buildScanContext(
         lines.push("RUNNING PORTS:");
         for (const p of scan.runningPorts) {
             lines.push(`  ${p.port} → PID ${p.pid} (${p.process})`);
+        }
+        lines.push("");
+    }
+
+    // Docker-compose port bindings (now parsed from YAML — INCOMPLETE 2 fix)
+    if (scan.dockerPorts && scan.dockerPorts.length > 0) {
+        lines.push("DOCKER COMPOSE PORTS:");
+        for (const dp of scan.dockerPorts) {
+            lines.push(`  ${dp.service}: host ${dp.hostPort} → container ${dp.containerPort}`);
         }
         lines.push("");
     }
@@ -371,8 +380,11 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
             renderDiagnosisResponse(msg.text, knownTypes);
         }
     } else {
-        // ── SEQUENTIAL: explore → diagnose → synthesize (Change 6d) ──────────
-        // exploreProject runs first, its result feeds diagnoseWithAgent
+        // ── SEQUENTIAL: explore → diagnose → synthesize ───────────────────────
+        // BUG 6 fix: stop diagSpinner BEFORE starting exploreSpinner so ora
+        // doesn't leave a ghost spinner line in the terminal.
+        diagSpinner.stop();
+
         const exploreSpinner = spin("exploring project...");
         const exploreResult = await exploreProject(projectPath).catch(() => null);
         exploreSpinner.stop();
@@ -408,13 +420,11 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
         });
         diagnoseSpinner.stop();
 
-        diagSpinner.stop();
-
         if (rawDiagnosis) {
             renderDiagnosisResponse(rawDiagnosis, knownTypes);
         }
 
-        // synthesize — Change 6c: wire to section display
+        // synthesize — merge explore + diagnose into a unified summary
         if (exploreResult && (rawDiagnosis || issues.length > 0)) {
             const synthSpinner = spin("synthesizing diagnosis...");
             const synthSummary = await synthesizeDiagnosis(exploreResult, rawDiagnosis, issues).catch(() => "");
@@ -425,8 +435,57 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
                     if (line.trim()) console.log(`  ${chalk.dim("│")} ${line}`);
                 }
                 console.log();
+                // INCOMPLETE 5 fix: inject synthesis into agent history so the
+                // agent is context-aware in chat mode without an extra LLM call.
+                primeContext(`[Diagnosis summary for this session]\n${synthSummary}`);
             }
         }
+    }
+
+    // ── PLAN MODE gate (INCOMPLETE 1 fix) ────────────────────────────────────
+    // If --plan was passed, show a clear summary of what would happen and ask
+    // the user to explicitly approve before any fixes are applied or chat starts.
+    if (plan) {
+        section("plan mode — review before applying");
+        console.log();
+        info(chalk.white("Diagnosis complete. No changes have been applied yet."));
+        console.log();
+
+        if (autoFixable.length > 0) {
+            info(chalk.bold("Auto-fixable issues:"));
+            for (const issue of autoFixable) {
+                console.log(`  ${chalk.green("✔")} ${chalk.white(issue.type)}: ${chalk.dim(issue.description)}`);
+            }
+            console.log();
+        }
+
+        if (manual.length > 0) {
+            info(chalk.bold("Requires manual action:"));
+            for (const issue of manual) {
+                console.log(`  ${chalk.yellow("⚠")} ${chalk.white(issue.type)}: ${chalk.dim(issue.description)}`);
+            }
+            console.log();
+        }
+
+        if (autoFixable.length === 0 && manual.length === 0) {
+            success("No issues found — project looks clean.");
+            closePrompt();
+            bye();
+            disconnect();
+            return;
+        }
+
+        const proceed = await confirm("proceed? (apply fixes and enter interactive chat mode)");
+        if (!proceed) {
+            info("Exiting plan mode. Run `fixd doctor` (without --plan) to apply fixes.");
+            closePrompt();
+            const finalMem = await summarizeSession(currentMemory, sessionLog.join("\n"), sessionChangedFiles);
+            await saveMemory(finalMem);
+            bye();
+            disconnect();
+            return;
+        }
+        // User approved — fall through to Phase 4 and Phase 5
     }
 
     // ── Phase 4: apply fixes locally (no agent, real fs writes) ──────────
@@ -561,14 +620,20 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
     console.log();
 
 
+    // BUG 1 fix: SessionState lives for the ENTIRE chat session, not per-turn.
+    // triedFixes and hypotheses persist so the agent never retries an identical
+    // patch across consecutive user messages.
+    // alreadyRan resets per turn — intentional: the user may legitimately ask
+    // to re-run the same command in a new message.
+    const chatState = makeSessionState();
+
     while (true) {
         const input = await prompt("you");
         if (!input) continue;
         if (["exit", "quit", "q", ":q"].includes(input.toLowerCase())) break;
 
         sessionLog.push(`you: ${input}`);
-        const state = makeSessionState();
-        await agenticTurn(input, projectPath, 0, state, new Set(), projectLibraries, sessionLog, sessionChangedFiles, issues);
+        await agenticTurn(input, projectPath, 0, chatState, new Set(), projectLibraries, sessionLog, sessionChangedFiles, issues);
     }
     closePrompt();
 
@@ -676,14 +741,13 @@ async function computeFixOutcome(
     projectRoot: string,
     issuesBefore: DetectedIssue[]
 ): Promise<{ outcome: "resolved" | "no_change" | "regression"; delta: number; newIssues: DetectedIssue[] }> {
-    const [newScan, newDiag] = await Promise.all([
-        scanProject(projectRoot).catch(() => null),
-        runDiagnostics(projectRoot).catch(() => []),
-    ]);
+    const newScan = await scanProject(projectRoot).catch(() => null);
     const newIssues = newScan ? detectIssues(newScan, projectRoot) : issuesBefore;
-    const diagErrs  = getAllErrors(newDiag);
+    // BUG 2 fix: compare DetectedIssue[] counts on both sides only.
+    // Previously newDiag errors were added to `after` but NOT to `before`, which
+    // made every partially-resolved fix read as a regression.
     const before = issuesBefore.length;
-    const after  = newIssues.length + diagErrs.length;
+    const after  = newIssues.length;
     const delta  = before - after;
     const outcome: "resolved" | "no_change" | "regression" =
         delta > 0 ? "resolved" : delta < 0 ? "regression" : "no_change";
@@ -722,6 +786,7 @@ async function agenticTurn(
         userMessage = formatHypothesesBlock(state.hypotheses) + "\n\n" + userMessage;
     }
 
+
     // ── READ FILES (depth 0 only) — Change 7: pass issueTypes ────────────────
     let fileContext = "";
     if (depth === 0) {
@@ -745,12 +810,12 @@ async function agenticTurn(
     parts.push(formatInstruction);
     let enrichedMessage = parts.filter(Boolean).join("\n");
 
-    // ── Relevance-gated Context7 (depth 0 only) ───────────────────────────────
-    if (depth === 0) {
+    // ── Relevance-gated Context7 (depth 0, INCOMPLETE 4 fix) ─────────────────
+    // Guard behind CONTEXT7_API_KEY: scoreDocRelevance makes an LLM call.
+    // Without the key fetchDocs always returns null, so the call is wasteful.
+    if (depth === 0 && process.env.CONTEXT7_API_KEY && projectLibraries.length > 0) {
         const relevantLibIds = await scoreDocRelevance(userMessage, projectLibraries).catch(() => projectLibraries);
-        if (relevantLibIds.length === 0) {
-            info("No library docs needed for this query");
-        } else {
+        if (relevantLibIds.length > 0) {
             const docs: LibraryDoc[] = await fetchDocsForQuery(userMessage, relevantLibIds).catch(() => []);
             if (docs.length > 0) {
                 enrichedMessage = `${formatDocsForPrompt(docs)}\n\n${enrichedMessage}`;
@@ -834,28 +899,39 @@ async function agenticTurn(
                 .filter((a) => !issuesBefore.some((b) => b.type === a.type))
                 .map((i) => i.type);
 
+            // IMPROVEMENT 6 fix: load memory ONCE, accumulate all causal entries
+            // and stack pattern updates, then save ONCE after the loop.
+            // Previously each patch triggered a full loadMemory→saveMemory cycle
+            // (N reads + N writes for N patches). Now it's always 1 read + 1 write.
             const mem = await loadMemory(projectRoot).catch(() => null);
             if (mem) {
+                const allIssueTypes  = [...new Set(issuesBefore.map((i) => i.type))];
+                const primaryIssue   = allIssueTypes[0] ?? "UNKNOWN";
+                const issueTypeLabel = allIssueTypes.join("|") || "UNKNOWN";
+                const outcomeLabel   = outcome === "resolved" ? "resolved"
+                                     : outcome === "regression" ? "regression" : "no_change";
+
+                let current = mem;
                 for (const p of applied) {
                     const causalEntry: CausalEntry = {
                         timestamp:     new Date().toISOString(),
                         file:          p.path,
-                        issueType:     issuesBefore[0]?.type ?? "UNKNOWN",
+                        issueType:     issueTypeLabel,
                         action:        claim.slice(0, 120),
-                        outcome:       outcome === "resolved" ? "resolved" : outcome === "regression" ? "regression" : "no_change",
+                        outcome:       outcomeLabel,
                         followupIssues,
                     };
-                    const withCausal = addCausalEntry(mem, causalEntry);
-                    // Change 5e: record stack pattern
-                    const withPattern = recordStackPattern(
-                        withCausal,
-                        mem.knownStack,
-                        issuesBefore[0]?.type ?? "UNKNOWN",
-                        claim.slice(0, 120),
-                        outcome === "resolved" ? "success" : "failure"
-                    );
-                    await saveMemory(withPattern).catch(() => {});
+                    current = addCausalEntry(current, causalEntry);
                 }
+                // Record stack pattern once (represents the whole batch)
+                current = recordStackPattern(
+                    current,
+                    mem.knownStack,
+                    primaryIssue,
+                    claim.slice(0, 120),
+                    outcome === "resolved" ? "success" : "failure"
+                );
+                await saveMemory(current).catch(() => {});
             }
 
             // Change 2c: outcome-based routing
@@ -886,6 +962,11 @@ async function agenticTurn(
             .replace(/<<<RENAME:[^\n>]+>>>/g, "");
         const pending = extractPendingCommands(textWithoutPatches, alreadyRan);
 
+        // BUG 3 fix: only ONE command is dispatched per recursion level, then
+        // we return immediately. Previously `continue` let the for-loop dispatch
+        // a second agenticTurn at the same depth, creating two parallel recursive
+        // subtrees. Now each command fires one recursive call and returns so the
+        // depth counter stays accurate and the agent handles follow-up naturally.
         for (const cmd of pending) {
             alreadyRan.add(cmd.command);
 
@@ -900,7 +981,7 @@ async function agenticTurn(
                 runSpinner.stop();
                 if (result.exitCode !== 0) printCommandResult(result);
                 await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues);
-                continue;
+                return; // ← was: continue
             }
 
             agentWantsToRun(cmd.command, cmd.reason, projectRoot);
@@ -911,7 +992,7 @@ async function agenticTurn(
                     `[User declined to run: \`${cmd.command}\`]. Propose alternative or explain manual steps.`,
                     projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues
                 );
-                continue;
+                return; // ← was: continue
             }
 
             const runSpinner = spin(`running: ${chalk.bold(cmd.command)}`);
@@ -919,6 +1000,7 @@ async function agenticTurn(
             runSpinner.stop();
             printCommandResult(result);
             await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues);
+            return; // stop after first command; recursion handles all follow-up
         }
     }
 }

@@ -58,10 +58,16 @@ Example: ["src/index.ts", "prisma/schema.prisma"]`;
         if (!match) return candidateFiles;
         const parsed: string[] = JSON.parse(match[0]);
         if (!Array.isArray(parsed)) return candidateFiles;
-        const filtered = parsed.filter((f) => candidateFiles.includes(f));
+        // Normalise before filtering — the model may add './' prefix or
+        // use different path separators from what we passed in.
+        const normCandidates = new Set(candidateFiles.map(normRelPath));
+        const filtered = parsed
+            .map(normRelPath)
+            .filter((f) => normCandidates.has(f))
+            // Map normalised path back to the original candidate spelling
+            .map((f) => candidateFiles.find((c) => normRelPath(c) === f) ?? f);
         return filtered.length > 0 ? filtered : candidateFiles;
     } catch {
-        // Always fall back to all candidates on any error
         return candidateFiles;
     }
 }
@@ -132,13 +138,14 @@ export async function readRelevantFiles(
 
     // Change 7: score file relevance — skip model call if too few candidates
     const relevantRel = await scoreFileRelevance(query, relCandidates, issueTypes);
-    const relevantSet = new Set(relevantRel);
+    // Use normalised paths so LLM-returned './src/foo.ts' matches 'src/foo.ts'
+    const relevantSet = new Set(relevantRel.map(normRelPath));
 
     for (const filePath of uniquePaths) {
         if (totalChars >= CHAR_LIMIT) break;
         const rel = path.relative(projectRoot, filePath);
         if (seen.has(rel)) continue;
-        if (relCandidates.length > 5 && !relevantSet.has(rel)) continue; // filtered out
+        if (relCandidates.length > 5 && !relevantSet.has(normRelPath(rel))) continue; // filtered out
         seen.add(rel);
 
         const content = await safeRead(filePath);
@@ -159,6 +166,16 @@ export async function readRelevantFiles(
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Normalise a relative path for comparison:
+ * - strip leading './' or '.\'
+ * - call path.normalize() for OS-agnostic separators
+ * This makes relevantSet.has() robust to LLM-returned path variations.
+ */
+function normRelPath(p: string): string {
+    return path.normalize(p).replace(/^[.][/\\]/, "");
+}
 
 function formatSnippet(rel: string, content: string): string {
     return `FILE: ${rel}\n\`\`\`\n${content}\n\`\`\``;

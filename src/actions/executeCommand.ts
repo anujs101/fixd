@@ -76,10 +76,10 @@ export async function executeCommand(
 }
 
 /**
- * Kill a process occupying a specific port.
+ * Kill all processes occupying a specific port.
+ * lsof can return multiple PIDs; we kill each one and then verify the port is free.
  */
 export async function killPort(port: number): Promise<CommandResult> {
-    // works on macOS and Linux
     const findPid = await executeCommand(`lsof -ti tcp:${port}`);
     if (!findPid.success || !findPid.stdout.trim()) {
         return {
@@ -91,8 +91,32 @@ export async function killPort(port: number): Promise<CommandResult> {
         };
     }
 
-    const pid = findPid.stdout.trim();
-    return executeCommand(`kill -9 ${pid}`);
+    // lsof can return multiple PIDs (one per line)
+    const pids = findPid.stdout.trim().split("\n").map((p) => p.trim()).filter(Boolean);
+    const killed: string[] = [];
+    const failed: string[] = [];
+
+    for (const pid of pids) {
+        const result = await executeCommand(`kill -9 ${pid}`);
+        if (result.success || result.exitCode === 0) {
+            killed.push(pid);
+        } else {
+            failed.push(pid);
+        }
+    }
+
+    // Short pause, then verify the port is actually free
+    await new Promise((r) => setTimeout(r, 300));
+    const verify = await executeCommand(`lsof -ti tcp:${port}`);
+    const portFree = !verify.success || !verify.stdout.trim();
+
+    return {
+        success: portFree && failed.length === 0,
+        stdout: killed.length > 0 ? `Killed PID(s): ${killed.join(", ")}` : "",
+        stderr: failed.length > 0 ? `Failed to kill PID(s): ${failed.join(", ")}` : "",
+        exitCode: portFree ? 0 : 1,
+        command: `killPort(${port})`,
+    };
 }
 
 /**

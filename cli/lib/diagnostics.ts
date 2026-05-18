@@ -333,11 +333,10 @@ function detectApplicableCheckers(projectPath: string): StackChecker[] {
 
 export async function runDiagnostics(projectPath: string): Promise<CheckerResult[]> {
     const checkers = detectApplicableCheckers(projectPath);
-    const results: CheckerResult[] = [];
 
     if (checkers.length === 0) {
-        // Fallback: nothing detected, return an empty "no stack found" result
-        results.push({
+        // Fallback: nothing detected, return a single "no stack found" entry
+        return [{
             checker: "none",
             stack: "Unknown",
             passed: true,
@@ -346,12 +345,11 @@ export async function runDiagnostics(projectPath: string): Promise<CheckerResult
             skipped: true,
             skipReason: "No recognised stack indicators found (no tsconfig.json, Cargo.toml, go.mod, etc.)",
             durationMs: 0,
-        });
-        return results;
+        }];
     }
 
-    await Promise.all(
-        checkers.map(async (checker) => {
+    const results: CheckerResult[] = await Promise.all(
+        checkers.map(async (checker): Promise<CheckerResult> => {
             const start = Date.now();
             // B5: respect the same FIXD_COMMAND_TIMEOUT env var used by executor.ts
             const envTimeout = parseInt(process.env.FIXD_COMMAND_TIMEOUT ?? "120000", 10);
@@ -367,7 +365,7 @@ export async function runDiagnostics(projectPath: string): Promise<CheckerResult
             }
 
             if (lastResult.exitCode === 127) {
-                results.push({
+                return {
                     checker: checker.command,
                     stack: checker.stack,
                     passed: true,
@@ -375,15 +373,14 @@ export async function runDiagnostics(projectPath: string): Promise<CheckerResult
                     skipped: true,
                     skipReason: `Tool not installed (tried: ${allCommands.join(", ")})`,
                     durationMs: Date.now() - start,
-                });
-                return;
+                };
             }
 
             const allIssues = checker.parseOutput(lastResult.stdout, lastResult.stderr, projectPath);
             const errors = allIssues.filter((e) => e.severity === "error");
             const warnings = allIssues.filter((e) => e.severity !== "error");
 
-            results.push({
+            return {
                 checker: checker.command,
                 stack: checker.stack,
                 passed: errors.length === 0,
@@ -391,7 +388,7 @@ export async function runDiagnostics(projectPath: string): Promise<CheckerResult
                 warnings,
                 skipped: false,
                 durationMs: Date.now() - start,
-            });
+            };
         })
     );
 
