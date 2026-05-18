@@ -83,6 +83,8 @@ const MAX_FIXED_ISSUES    = 50;
 const MAX_CHAT_SUMMARIES  = 10;
 const MAX_CAUSAL_ENTRIES  = 30;
 const MAX_STACK_PATTERNS  = 50;
+const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
+const MIN_PATTERNS_TO_KEEP = 5;
 
 // ─── Dep-pattern maps ─────────────────────────────────────────────────────────
 
@@ -130,6 +132,34 @@ function memoryFilePath(projectRoot: string): string {
     return path.join(projectRoot, MEMORY_DIR, MEMORY_FILENAME);
 }
 
+function pruneStackPatterns(memory: ProjectMemory): void {
+    const patterns = memory.stackPatterns ?? [];
+    if (patterns.length <= MIN_PATTERNS_TO_KEEP) {
+        memory.stackPatterns = patterns;
+        return;
+    }
+
+    const now = Date.now();
+    const survivors = patterns.filter((p) => {
+        if (p.confidence < 0.2 && p.seenCount > 5) return false;
+
+        const lastSeen = new Date(p.lastSeen).getTime();
+        if (!Number.isNaN(lastSeen) && now - lastSeen > NINETY_DAYS_MS) return false;
+
+        return true;
+    });
+
+    if (survivors.length >= MIN_PATTERNS_TO_KEEP) {
+        memory.stackPatterns = survivors;
+        return;
+    }
+
+    const restored = [...patterns]
+        .sort((a, b) => b.confidence - a.confidence)
+        .slice(0, MIN_PATTERNS_TO_KEEP);
+    memory.stackPatterns = restored;
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /** Load memory from disk. Returns empty memory if file missing. Never throws. */
@@ -145,6 +175,8 @@ export async function loadMemory(projectRoot: string): Promise<ProjectMemory> {
 
 /** Atomically write memory to .fixd/memory.json. Never throws. */
 export async function saveMemory(memory: ProjectMemory): Promise<void> {
+    pruneStackPatterns(memory);
+
     try {
         const dir = path.join(memory.projectRoot, MEMORY_DIR);
         await fs.mkdir(dir, { recursive: true });

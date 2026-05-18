@@ -95,8 +95,6 @@ const KNOWN_LIBRARIES: Record<string, string> = {
     // runtime
     "bun":         "/oven-sh/bun",
 
-    // nosana
-    "nosana":      "/nosana-ci/nosana-node",
 };
 
 // ─── In-memory search cache ───────────────────────────────────────────────────

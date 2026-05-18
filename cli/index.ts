@@ -23,10 +23,9 @@ import {
     bye,
 } from "./lib/display.js";
 import { SMALL_MODEL, LARGE_MODEL } from "./lib/llm.js";
+import { checkForUpdate, getCurrentVersion } from "./lib/versionCheck.js";
 
-import { readFileSync } from "node:fs";
-const _pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")) as { version: string };
-const VERSION = _pkg.version; // always in sync with package.json
+const VERSION = getCurrentVersion();
 
 // ─── Help text ────────────────────────────────────────────────────────────────
 
@@ -55,7 +54,13 @@ function printHelp() {
         `    ${chalk.cyan("fixd init --yes")}      ${chalk.dim("scaffold with all defaults (hono + neon + prisma + bun)")}`
     );
     console.log(
-        `    ${chalk.cyan("fixd deploy")}          ${chalk.dim("containerize + ship to nosana GPU")}`
+        `    ${chalk.cyan("fixd config")}          ${chalk.dim("manage API keys and configuration")}`
+    );
+    console.log(
+        `    ${chalk.cyan("fixd update")}          ${chalk.dim("update fixd to the latest npm version")}`
+    );
+    console.log(
+        `    ${chalk.cyan("fixd deploy")}          ${chalk.dim("containerize project with Docker")}`
     );
     console.log(
         `    ${chalk.cyan("fixd undo")}            ${chalk.dim("restore files from the last patch session")}`
@@ -89,9 +94,23 @@ function printHelp() {
     console.log();
 }
 
+function printConfigHelp() {
+    console.log();
+    console.log(`  ${chalk.bold.white("fixd config")}`);
+    console.log();
+    console.log(`  ${chalk.bold("Examples:")}`);
+    console.log(`    ${chalk.cyan("fixd config")}                    ${chalk.dim("interactive setup wizard")}`);
+    console.log(`    ${chalk.cyan("fixd config list")}               ${chalk.dim("show all configured keys")}`);
+    console.log(`    ${chalk.cyan("fixd config set GROQ_API_KEY=sk-...")}`);
+    console.log(`    ${chalk.cyan("fixd config get GROQ_API_KEY")}`);
+    console.log(`    ${chalk.cyan("fixd config delete GROQ_API_KEY")}`);
+    console.log();
+}
+
 // ─── Status command ───────────────────────────────────────────────────────────
 
 async function runStatus() {
+    checkForUpdate().catch(() => {});
     printHeader("status");
 
     // Small model — Groq
@@ -181,9 +200,46 @@ async function runInit(useDefaults = false) {
     await _runInit(useDefaults);
 }
 
-async function runDeploy() {
+async function runDeploy(options: { build?: boolean; run?: boolean; push?: boolean } = {}) {
     const { runDeploy } = await import("./deploy.js");
-    await runDeploy();
+    await runDeploy(process.cwd(), options);
+}
+
+async function runUpdate() {
+    const { runUpdate } = await import("./update.js");
+    await runUpdate();
+}
+
+async function runConfig(subcommand?: string, value?: string) {
+    const {
+        runConfigWizard,
+        runConfigSet,
+        runConfigGet,
+        runConfigList,
+        runConfigDelete,
+    } = await import("./config.js");
+
+    if (!subcommand) {
+        await runConfigWizard();
+    } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
+        printConfigHelp();
+    } else if (subcommand === "list") {
+        runConfigList();
+    } else if (subcommand === "set") {
+        if (!value) { error("Usage: fixd config set KEY=VALUE"); process.exit(1); }
+        runConfigSet(value);
+    } else if (subcommand === "get") {
+        if (!value) { error("Usage: fixd config get KEY"); process.exit(1); }
+        runConfigGet(value);
+    } else if (subcommand === "delete") {
+        if (!value) { error("Usage: fixd config delete KEY"); process.exit(1); }
+        runConfigDelete(value);
+    } else if (subcommand.includes("=")) {
+        runConfigSet(subcommand);
+    } else {
+        error(`Unknown config subcommand: ${subcommand}. Run fixd config --help`);
+        process.exit(1);
+    }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -193,30 +249,43 @@ async function main() {
     const command = args[0];
     const flags = args.slice(1);
 
-    if (!command || flags.includes("--help") || flags.includes("-h") || command === "help") {
+    if (!command || command === "--help" || command === "-h" || flags.includes("--help") || flags.includes("-h") || command === "help") {
         printHelp();
         return;
     }
 
-    if (flags.includes("--version") || flags.includes("-v") || command === "version") {
+    if (command === "--version" || command === "-v" || flags.includes("--version") || flags.includes("-v") || command === "version") {
         console.log(`fixd v${VERSION}`);
         return;
     }
 
     switch (command) {
         case "doctor": {
+            checkForUpdate().catch(() => {});
             if (!(await preflight())) break;
             await runDoctor(flags.includes("--fast"), flags.includes("--plan"));
             break;
         }
         case "init": {
+            checkForUpdate().catch(() => {});
             if (!(await preflight())) break;
             await runInit(flags.includes("--yes") || flags.includes("-y"));
             break;
         }
         case "deploy": {
-            if (!(await preflight())) break;
-            await runDeploy();
+            await runDeploy({
+                build: flags.includes("--build") ? true : undefined,
+                run: flags.includes("--run") ? true : undefined,
+                push: flags.includes("--push") ? true : undefined,
+            });
+            break;
+        }
+        case "config": {
+            await runConfig(flags[0], flags[1]);
+            break;
+        }
+        case "update": {
+            await runUpdate();
             break;
         }
         case "plan": {

@@ -62,7 +62,9 @@ These aren't hard problems — they're **tedious, repetitive, and context-depend
 | `fixd plan` | Alias for `fixd doctor --plan --fast` |
 | `fixd init` | Scaffold a new project from scratch with live docs |
 | `fixd init --yes` | Scaffold with defaults (Hono + Neon + Prisma + Bun) |
-| `fixd deploy` | Generate Dockerfile + Nosana job definition |
+| `fixd config` | Manage API keys and local configuration |
+| `fixd update` | Update fixd to the latest npm version |
+| `fixd deploy` | Generate Dockerfile, docker-compose.yml, build, run, or push an image |
 | `fixd undo` | Restore all files from the last patch session |
 | `fixd status` | Check API connectivity and active models |
 
@@ -102,11 +104,28 @@ Runs the full diagnostic pipeline, displays the synthesis summary, and asks for 
 - **Context7 doc injection** — fetches live, version-accurate library docs before generation, eliminating stale API hallucinations
 - **Completeness guard** — ensures auth files, Prisma schema, and frontend entry points are never omitted
 - **FIXD.md generation** — writes a `FIXD.md` into your project for future `fixd doctor` sessions to read for instant stack context
+- **Memory warm-up** — initializes `.fixd/memory.json` with the scaffolded stack so `fixd doctor` starts with context
 - **Automated setup** — runs `git init` + commit + `bun/npm install` + `prisma generate` automatically
 
-### `fixd deploy` — Containerize & Ship
+### `fixd config` — API Keys & Local Settings
 
-Generates a production-ready `Dockerfile` and Nosana job definition from your project structure.
+```bash
+fixd config
+fixd config list
+fixd config set GROQ_API_KEY=gsk_xxx
+fixd config get GROQ_API_KEY
+fixd config delete GROQ_API_KEY
+```
+
+Writes user-level configuration to `~/.config/fixd/.env`, keeping API keys out of project repositories.
+
+### `fixd update` — Upgrade from npm
+
+Checks the published npm version and runs `npm install -g fixd@<latest>` when an update is available. `fixd doctor`, `fixd init`, and `fixd status` also perform a cached, non-blocking update check once every 24 hours.
+
+### `fixd deploy` — Containerize
+
+Generates a production-ready `Dockerfile`, optionally writes `docker-compose.yml`, then asks before building, running locally, or pushing the image to Docker Hub, GitHub Container Registry, or a custom registry.
 
 ### `fixd undo` — Atomic Rollback
 
@@ -238,6 +257,12 @@ npm install   # or: bun install
 The recommended location is `~/.config/fixd/.env` — this keeps your keys out of any project repository:
 
 ```bash
+fixd config
+```
+
+Or create the file manually:
+
+```bash
 mkdir -p ~/.config/fixd
 cat > ~/.config/fixd/.env << 'EOF'
 # Required
@@ -362,7 +387,9 @@ fixd/
 │   ├── index.ts                # Entry — arg parsing, preflight, routing
 │   ├── doctor.ts               # Doctor pipeline + agenticTurn() loop
 │   ├── init.ts                 # Scaffolding interview + generation
-│   ├── deploy.ts               # Dockerfile + Nosana job generation
+│   ├── config.ts               # User-level API key/config management
+│   ├── update.ts               # npm update command
+│   ├── deploy.ts               # Dockerfile/docker-compose generation + image workflow
 │   ├── undo.ts                 # Backup restoration
 │   └── lib/
 │       ├── llm.ts              # Multi-service LLM client (Groq/OpenRouter/Clarifai)
@@ -375,6 +402,7 @@ fixd/
 │       ├── executor.ts         # Shell command extraction + execution
 │       ├── projectReader.ts    # Scored file relevance reader
 │       ├── command-classifier.ts # 3-stage safety pipeline
+│       ├── versionCheck.ts      # Cached npm update checks
 │       └── display.ts          # Terminal UI: spinners, colours, prompts
 ├── src/
 │   └── actions/
@@ -444,7 +472,7 @@ fixd/
 | `OPENROUTER_LARGE_MODEL` | optional | — | Override large model name |
 | `SMALL_MODEL` | optional | — | Override small model name |
 
-Config is loaded in priority order: `~/.config/fixd/.env` → `~/.fixd/.env` → `<project>/.env`
+Config is loaded in priority order: `~/.config/fixd/.env` → `~/.fixd/.env` → `<project>/.env`. Use `fixd config` to manage the recommended user-level file.
 
 ---
 

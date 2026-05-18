@@ -554,6 +554,33 @@ export async function runInit(useDefaults = false) {
         }
     }
 
+    // Warm memory with stack knowledge from this scaffold session.
+    try {
+        const { loadMemory, saveMemory, recordStackPattern } = await import("./lib/memory.js");
+        let memory = await loadMemory(projectDir);
+
+        memory.knownStack = {
+            ...memory.knownStack,
+            packageManager: spec.pkgManager || "npm",
+            frameworks: [spec.framework].filter(Boolean),
+            orms: spec.orm && spec.orm !== "none" ? [spec.orm] : [],
+            databases: spec.database && spec.database !== "none" ? [spec.database] : [],
+        };
+
+        memory = recordStackPattern(
+            memory,
+            memory.knownStack,
+            "INIT_SCAFFOLD",
+            `Scaffolded with ${spec.framework}${spec.orm !== "none" ? ` + ${spec.orm}` : ""}${spec.database !== "none" ? ` + ${spec.database}` : ""}`,
+            "success"
+        );
+
+        await saveMemory(memory);
+        info("Project memory initialized — fixd doctor will start with stack context.");
+    } catch {
+        // Non-fatal — init succeeded, memory warm-up is best-effort.
+    }
+
     // ── .env checklist ────────────────────────────────────────────────────────
 
     if (scaffoldPlan?.envVarsRequired) {
