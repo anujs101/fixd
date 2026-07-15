@@ -170,7 +170,27 @@ export async function sendMessage(
         ...trimmed,
     ];
 
-    const reply = await chat(messages, task);
+    // P0 fix: retry once on transient failures (network errors, 5xx).
+    // Auth errors (401/403) and other permanent errors are not retried.
+    let reply: string;
+    try {
+        reply = await chat(messages, task);
+    } catch (err: any) {
+        // Don't retry auth errors — they won't resolve without config changes
+        if (err.message?.includes("Invalid") || err.message?.includes("API key")) {
+            history.pop(); // remove orphaned user message
+            throw err;
+        }
+        // Transient: wait 2s and retry once
+        const { warn: displayWarn } = await import("./display.js");
+        displayWarn(`API call failed (${err.message}) — retrying once...`);
+        try {
+            reply = await chat(messages, task);
+        } catch (retryErr: any) {
+            history.pop(); // remove orphaned user message
+            throw retryErr;
+        }
+    }
 
     history.push({ role: "assistant", content: reply });
 
@@ -193,13 +213,13 @@ export function primeContext(text: string): void {
     history.push({ role: "assistant", content: text });
 }
 
-// ─── checkHealth — verify GROQ_API_KEY + reachability ────────────────────────
+// ─── Endpoint health ─────────────────────────────────────────────────────────
 
-export async function checkHealth(): Promise<boolean> {
-    const key = process.env.GROQ_API_KEY;
-    if (!key) return false;
+import { loadConfig, getEndpoint, type Endpoint } from "./endpoints.js";
 
+export async function checkEndpoint(endpoint: Endpoint): Promise<boolean> {
     try {
+        // Simple connectivity check: try a minimal completion
         await ask("ping", "classify", "Reply with: pong");
         return true;
     } catch {
@@ -207,20 +227,18 @@ export async function checkHealth(): Promise<boolean> {
     }
 }
 
-// ─── checkOpenRouterHealth — verify OPENROUTER_API_KEY reachability ───────────
-
-export async function checkOpenRouterHealth(): Promise<"ok" | "no_key" | "unreachable"> {
-    const key = process.env.OPENROUTER_API_KEY;
-    if (!key) return "no_key";
-    try {
-        const res = await fetch("https://openrouter.ai/api/v1/models", {
-            headers: { Authorization: `Bearer ${key}` },
-            signal: AbortSignal.timeout(8_000),
-        });
-        return res.ok ? "ok" : "unreachable";
-    } catch {
-        return "unreachable";
+export async function checkAllEndpoints(): Promise<{ name: string; ok: boolean; error?: string }[]> {
+    const config = await loadConfig();
+    const results: { name: string; ok: boolean; error?: string }[] = [];
+    for (const ep of config.endpoints) {
+        try {
+            const ok = await checkEndpoint(ep);
+            results.push({ name: ep.name, ok, error: ok ? undefined : "unreachable" });
+        } catch (err: any) {
+            results.push({ name: ep.name, ok: false, error: err.message });
+        }
     }
+    return results;
 }
 
 // ─── disconnect — no-op, kept for API compatibility ──────────────────────────

@@ -201,14 +201,10 @@ export async function scanProject(projectPath: string): Promise<ProjectScan> {
     }
 
     // ── Read all config files in parallel ──────────────────────────────────────
-    const [
-        packageJson,
-        tsconfig,
-        envRaw,
-        prismaSchemaRaw,
-        dockerComposeYml,
-        dockerComposeYaml,
-    ] = await Promise.all([
+    // P1 fix: Promise.allSettled ensures independent file reads don't cascade.
+    // If one file read fails unexpectedly, the other five still complete and
+    // the scan produces partial results instead of failing entirely.
+    const results = await Promise.allSettled([
         readJsonFile(path.join(projectPath, "package.json")),
         readJsonFile(path.join(projectPath, "tsconfig.json")),
         readTextFile(path.join(projectPath, ".env")),
@@ -216,6 +212,19 @@ export async function scanProject(projectPath: string): Promise<ProjectScan> {
         readTextFile(path.join(projectPath, "docker-compose.yml")),
         readTextFile(path.join(projectPath, "docker-compose.yaml")),
     ]);
+
+    function unwrap<T>(result: PromiseSettledResult<T>, label: string): T | null {
+        if (result.status === "fulfilled") return result.value;
+        errors.push(`Failed to read ${label}: ${String(result.reason)}`);
+        return null;
+    }
+
+    const packageJson       = unwrap(results[0], "package.json") as Record<string, any> | null;
+    const tsconfig          = unwrap(results[1], "tsconfig.json") as Record<string, any> | null;
+    const envRaw            = unwrap(results[2], ".env") as string | null;
+    const prismaSchemaRaw   = unwrap(results[3], "prisma/schema.prisma") as string | null;
+    const dockerComposeYml  = unwrap(results[4], "docker-compose.yml") as string | null;
+    const dockerComposeYaml = unwrap(results[5], "docker-compose.yaml") as string | null;
 
     // ── Parse .env ─────────────────────────────────────────────────────────────
     const envVars = envRaw ? parseEnvFile(envRaw) : {};

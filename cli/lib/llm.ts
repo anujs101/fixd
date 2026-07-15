@@ -1,64 +1,36 @@
-// ─── Multi-service LLM client ────────────────────────────────────────────────
-// Large model calls:
-//   1. OpenRouter  → openai/gpt-oss-120b:free   (primary)
-//   2. Clarifai    → gpt-oss-120b high-throughput (fallback on any OpenRouter error)
+// ─── Endpoint-based LLM client ────────────────────────────────────────────────
+// Routes every LLM call through the endpoint abstraction layer. No hardcoded
+// providers. No hardcoded base URLs. Every request goes to whichever endpoint
+// is configured for the task type.
 //
-// Small model calls always go to Groq.
-//
-// Required env vars:
-//   GROQ_API_KEY          — small model (always required)
-//   OPENROUTER_API_KEY    — large model primary
-//   CLARIFAI_PAT          — large model fallback
-//   CLARIFAI_LARGE_MODEL  — optional, override the default Clarifai model URL
+// Required config: ~/.config/fixd/config.json (endpoints + task routing)
+// Legacy env vars (GROQ_API_KEY, etc.) are auto-migrated on first run.
 
 import { spin, warn } from "./display.js";
+import { getConfig, getRouting, type TaskName } from "./endpoints.js";
+import { endpointFetch, type ChatPayload } from "./adapters/dispatch.js";
 
-// ─── Base URLs ────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-const GROQ_BASE_URL       = "https://api.groq.com/openai/v1";
-const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
-const CLARIFAI_BASE_URL   = "https://api.clarifai.com/v2/ext/openai/v1";
-
-// ─── Model identifiers ────────────────────────────────────────────────────────
-
-// Small model — always served by Groq
-const SMALL_MODEL = process.env.SMALL_MODEL ?? "meta-llama/llama-4-scout-17b-16e-instruct";
-
-// Large model — OpenRouter (primary)
-const OPENROUTER_LARGE_MODEL = process.env.OPENROUTER_LARGE_MODEL ?? "openai/gpt-oss-120b:free";
-
-// Large model — Clarifai (fallback)
-const CLARIFAI_DEFAULT_LARGE_MODEL =
-    "https://clarifai.com/openai/chat-completion/models/gpt-oss-120b-high-throughput/versions/ce70fc95cef1411898db183e409e98d8";
-const CLARIFAI_LARGE_MODEL =
-    process.env.CLARIFAI_LARGE_MODEL ?? CLARIFAI_DEFAULT_LARGE_MODEL;
-
-// Exported alias — refers to the primary large model
-const LARGE_MODEL = OPENROUTER_LARGE_MODEL;
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export type Task = "classify" | "explain" | "generate" | "diagnose" | "chat";
+export type Task = TaskName;
 
 export interface Message {
     role: "user" | "assistant" | "system";
     content: string;
 }
 
-// ─── Model routing ────────────────────────────────────────────────────────────
+// ─── Model routing (task type → model size hint) ──────────────────────────────
+// This is a HINT for endpoint selection. The actual endpoint+model is determined
+// by the user's config.json routing table. This function is kept for backward
+// compatibility with callers that use pickModel() directly.
 
 const CODE_INTENT_RE =
     /\b(generat|scaffold|creat|write|build|implement|code|file|class|function|component)\b/i;
 
-// Analysis intent — technical terms that warrant the large model.
-// Intentionally excludes casual words (what, how, why, understand) to avoid
-// routing simple questions to the expensive large model (fix 2.3).
 const ANALYSIS_INTENT_RE =
     /\b(analys|analyze|summary|overview|review|fix|debug|refactor|diagnos|issue|error|problem|implement|migrat)\b/i;
 
-function pickModel(task: Task, prompt?: string): "small" | "large" {
+export function pickModel(task: Task, prompt?: string): "small" | "large" {
     switch (task) {
         case "generate":
         case "diagnose":
@@ -68,61 +40,76 @@ function pickModel(task: Task, prompt?: string): "small" | "large" {
             return "small";
         case "chat":
             if (!prompt) return "small";
-            if (prompt.includes("--- PROJECT FILES")) return "large";
+            if (prompt.includes("--- PROJECT FILES") || prompt.includes("--- FILE:")) return "large";
+            if (prompt.includes("```")) return "large";
             if (CODE_INTENT_RE.test(prompt) || ANALYSIS_INTENT_RE.test(prompt)) return "large";
             return "small";
     }
 }
 
-// ─── API key helpers ──────────────────────────────────────────────────────────
+// ─── Task-aware LLM parameters ──────────────────────────────────────────────────
 
-function getGroqKey(): string {
-    const key = process.env.GROQ_API_KEY;
-    if (!key) throw new Error("GROQ_API_KEY is not set. Add it to your .env file.");
-    return key;
+function taskParams(task: Task): { temperature: number; max_tokens: number } {
+    switch (task) {
+        case "classify":
+            return { temperature: 0.1, max_tokens: 512 };
+        case "explain":
+            return { temperature: 0.5, max_tokens: 2048 };
+        case "generate":
+            return { temperature: 0.7, max_tokens: 8192 };
+        case "diagnose":
+            return { temperature: 0.3, max_tokens: 8192 };
+        case "chat":
+            return { temperature: 0.7, max_tokens: 4096 };
+    }
 }
 
-function getOpenRouterKey(): string {
-    const key = process.env.OPENROUTER_API_KEY;
-    if (!key) throw new Error("OPENROUTER_API_KEY is not set. Add it to your .env file.");
-    return key;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getClarifaiKey(): string {
-    const key = process.env.CLARIFAI_PAT;
-    if (!key)
+// ─── Fetch with retry (endpoint-agnostic) ─────────────────────────────────────
+// Preserves the P0-2 retry behavior: network errors, 429, and 5xx are retried
+// with backoff. Auth errors (401/403) throw immediately.
+
+async function fetchWithRetry(
+    payload: ChatPayload,
+    retries = 3,
+): Promise<Response> {
+    // Load config and resolve the endpoint + model for this task
+    // The task is embedded in a custom property on the payload (set by callers)
+    const task = (payload as any).__task as Task | undefined;
+    if (!task) throw new Error("Internal error: payload missing __task");
+
+    const config = await getConfig();
+    const { endpoint, model } = getRouting(config, task);
+
+    if (!endpoint) {
         throw new Error(
-            "CLARIFAI_PAT is not set. Add it to your .env file (used as OpenRouter fallback)."
+            `No endpoint configured for task "${task}". Run \`fixd config\` to set up endpoints and routing.`
         );
-    return key;
-}
+    }
 
-// ─── Payload / error types ────────────────────────────────────────────────────
+    // Override the model in the payload with the configured model
+    const resolvedPayload = { ...payload, model };
+    delete (resolvedPayload as any).__task;
 
-interface ChatPayload {
-    model: string;
-    messages: Message[];
-    stream?: boolean;
-    temperature?: number;
-    max_tokens?: number;
-}
-
-interface LLMError {
-    error: { message: string; type: string; code: string };
-}
-
-// ─── Groq fetch (small model, with retry + rate-limit handling) ───────────────
-
-async function groqFetch(payload: ChatPayload, retries = 3): Promise<Response> {
     for (let attempt = 1; attempt <= retries; attempt++) {
-        const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${getGroqKey()}`,
-            },
-            body: JSON.stringify(payload),
-        });
+        let res: Response;
+        try {
+            res = await endpointFetch(endpoint, resolvedPayload);
+        } catch (err: any) {
+            if (attempt < retries) {
+                const wait = attempt * 5;
+                const s = spin(`${endpoint.name} network error — retrying in ${wait}s (attempt ${attempt}/${retries})...`);
+                await sleep(wait * 1000);
+                s.stop();
+                continue;
+            }
+            throw new Error(`${endpoint.name} unreachable: ${err.message}`);
+        }
 
         if (res.ok) return res;
 
@@ -130,170 +117,34 @@ async function groqFetch(payload: ChatPayload, retries = 3): Promise<Response> {
             const retryAfter = res.headers.get("retry-after");
             const waitSeconds = retryAfter ? parseInt(retryAfter, 10) : attempt * 15;
             if (attempt < retries) {
-                const s = spin(`rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
+                const s = spin(`${endpoint.name} rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
                 await sleep(waitSeconds * 1000);
                 s.stop();
                 continue;
             }
-            throw new Error(
-                `Groq rate limit exceeded. Wait ${waitSeconds}s and retry.\n` +
-                `Tip: reduce usage or upgrade at console.groq.com`
-            );
-        }
-
-        if (res.status === 401) throw new Error("Invalid GROQ_API_KEY. Check your .env file.");
-
-        if (res.status === 503 || res.status === 502) {
-            if (attempt < retries) {
-                const wait = attempt * 5;
-                const s = spin(`Groq unavailable — retrying in ${wait}s...`);
-                await sleep(wait * 1000);
-                s.stop();
-                continue;
-            }
-            throw new Error("Groq API is currently unavailable. Try again in a moment.");
-        }
-
-        const errBody = (await res.json().catch(() => null)) as LLMError | null;
-        throw new Error(errBody?.error?.message ?? `Groq API error ${res.status}`);
-    }
-
-    throw new Error("Groq request failed after all retries.");
-}
-
-// ─── OpenRouter fetch (large model primary) ───────────────────────────────────
-
-async function openRouterFetch(payload: ChatPayload, retries = 3): Promise<Response> {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${getOpenRouterKey()}`,
-                "HTTP-Referer": "https://github.com/anujs101/fixd",
-                "X-Title": "fixd",
-            },
-            body: JSON.stringify(payload),
-        });
-
-        if (res.ok) return res;
-
-        if (res.status === 429) {
-            const waitSeconds = attempt * 15;
-            if (attempt < retries) {
-                const s = spin(`OpenRouter rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
-                await sleep(waitSeconds * 1000);
-                s.stop();
-                continue;
-            }
-            throw new Error(`OpenRouter rate limit exceeded. Wait ${waitSeconds}s and retry.`);
+            throw new Error(`${endpoint.name} rate limit exceeded. Wait ${waitSeconds}s and retry.`);
         }
 
         if (res.status === 401 || res.status === 403) {
-            throw new Error("Invalid OPENROUTER_API_KEY. Check your .env file.");
+            throw new Error(`Invalid API key for endpoint "${endpoint.name}". Check \`fixd config\`.`);
         }
 
-        if (res.status === 503 || res.status === 502) {
+        if (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) {
             if (attempt < retries) {
                 const wait = attempt * 5;
-                const s = spin(`OpenRouter unavailable — retrying in ${wait}s...`);
+                const s = spin(`${endpoint.name} unavailable (${res.status}) — retrying in ${wait}s...`);
                 await sleep(wait * 1000);
                 s.stop();
                 continue;
             }
-            throw new Error("OpenRouter API is currently unavailable.");
+            throw new Error(`${endpoint.name} is currently unavailable. Try again in a moment.`);
         }
 
-        const errBody = (await res.json().catch(() => null)) as LLMError | null;
-        throw new Error(errBody?.error?.message ?? `OpenRouter API error ${res.status}`);
+        const errBody = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+        throw new Error(errBody?.error?.message ?? `${endpoint.name} API error ${res.status}`);
     }
 
-    throw new Error("OpenRouter request failed after all retries.");
-}
-
-// ─── Clarifai fetch (large model fallback) ────────────────────────────────────
-
-async function clarifaiFetch(payload: ChatPayload, retries = 3): Promise<Response> {
-    for (let attempt = 1; attempt <= retries; attempt++) {
-        const res = await fetch(`${CLARIFAI_BASE_URL}/chat/completions`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${getClarifaiKey()}`,
-            },
-            body: JSON.stringify(payload),
-        });
-
-        if (res.ok) return res;
-
-        if (res.status === 429) {
-            const waitSeconds = attempt * 15;
-            if (attempt < retries) {
-                const s = spin(`Clarifai rate limited — waiting ${waitSeconds}s (attempt ${attempt}/${retries})...`);
-                await sleep(waitSeconds * 1000);
-                s.stop();
-                continue;
-            }
-            throw new Error(`Clarifai rate limit exceeded. Wait ${waitSeconds}s and retry.`);
-        }
-
-        if (res.status === 401 || res.status === 403) {
-            throw new Error("Invalid CLARIFAI_PAT. Check your .env file.");
-        }
-
-        if (res.status === 503 || res.status === 502) {
-            if (attempt < retries) {
-                const wait = attempt * 5;
-                const s = spin(`Clarifai unavailable — retrying in ${wait}s...`);
-                await sleep(wait * 1000);
-                s.stop();
-                continue;
-            }
-            throw new Error("Clarifai API is currently unavailable. Try again in a moment.");
-        }
-
-        const errBody = (await res.json().catch(() => null)) as LLMError | null;
-        throw new Error(errBody?.error?.message ?? `Clarifai API error ${res.status}`);
-    }
-
-    throw new Error("Clarifai request failed after all retries.");
-}
-
-// ─── Unified fetch dispatcher ─────────────────────────────────────────────────
-// Small model → Groq
-// Large model → OpenRouter (primary) → Clarifai (fallback on any error)
-
-async function llmFetch(
-    modelSize: "small" | "large",
-    messages: Message[],
-    stream: boolean
-): Promise<Response> {
-    if (modelSize === "small") {
-        return groqFetch({ model: SMALL_MODEL, messages, stream });
-    }
-
-    // Large model: OpenRouter first, Clarifai on any failure
-    try {
-        return await openRouterFetch({ model: OPENROUTER_LARGE_MODEL, messages, stream });
-    } catch (err: any) {
-        warn(`OpenRouter failed (${err.message}) — falling back to Clarifai`);
-        return clarifaiFetch({ model: CLARIFAI_LARGE_MODEL, messages, stream });
-    }
-}
-
-// ─── Fallback for large model on heavy tasks ──────────────────────────────────
-// If both OpenRouter and Clarifai fail, fall back to the small model on Groq.
-
-async function llmFetchWithFallback(
-    messages: Message[],
-    stream: boolean
-): Promise<Response> {
-    try {
-        return await llmFetch("large", messages, stream);
-    } catch (err: any) {
-        warn(`All large-model services failed — falling back to ${SMALL_MODEL}`);
-        return groqFetch({ model: SMALL_MODEL, messages, stream });
-    }
+    throw new Error(`${endpoint.name} request failed after all retries.`);
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -315,18 +166,19 @@ export async function ask(
     if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
     messages.push({ role: "user", content: prompt });
 
-    const modelSize = pickModel(task, prompt);
+    const { temperature, max_tokens } = taskParams(task);
 
-    let res: Response;
-    if (modelSize === "large") {
-        res = await llmFetchWithFallback(messages, false);
-    } else {
-        res = await llmFetch("small", messages, false);
-    }
+    const res = await fetchWithRetry({
+        model: "", // overridden by fetchWithRetry
+        messages,
+        stream: false,
+        temperature,
+        max_tokens,
+        __task: task,
+    } as ChatPayload & { __task: Task });
 
     const data = (await res.json()) as any;
     const choice = data.choices?.[0];
-    // A1: warn when the model was cut off mid-response (finish_reason "length" = token limit)
     if (choice?.finish_reason === "length") {
         warn("⚠ agent response was truncated (token limit hit) — output may be incomplete");
     }
@@ -335,7 +187,6 @@ export async function ask(
 
 /**
  * Streaming variant — yields text chunks as they arrive.
- * Best for generate tasks where real-time display matters.
  */
 export async function* askStream(
     prompt: string,
@@ -346,17 +197,23 @@ export async function* askStream(
     if (systemPrompt) messages.push({ role: "system", content: systemPrompt });
     messages.push({ role: "user", content: prompt });
 
-    const modelSize = pickModel(task, prompt);
-    // B2: large-model streaming uses llmFetchWithFallback (OpenRouter → Clarifai)
-    const res = modelSize === "large"
-        ? await llmFetchWithFallback(messages, true)
-        : await llmFetch("small", messages, true);
+    const { temperature, max_tokens } = taskParams(task);
+
+    const res = await fetchWithRetry({
+        model: "",
+        messages,
+        stream: true,
+        temperature,
+        max_tokens,
+        __task: task,
+    } as ChatPayload & { __task: Task });
 
     if (!res.body) throw new Error("No response body for streaming request");
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
+    let visible = "";
 
     while (true) {
         const { done, value } = await reader.read();
@@ -374,7 +231,13 @@ export async function* askStream(
             try {
                 const json = JSON.parse(trimmed.slice(6));
                 const chunk = json.choices?.[0]?.delta?.content;
-                if (chunk) yield chunk;
+                if (chunk) {
+                    visible += chunk;
+                    if (/<think>[\s\S]*$/i.test(visible) && !/<\/think>/i.test(visible)) continue;
+                    const stripped = stripThink(visible);
+                    if (stripped) yield stripped;
+                    visible = "";
+                }
             } catch {
                 // Malformed chunk — skip
             }
@@ -387,27 +250,27 @@ export async function* askStream(
  */
 export async function chat(messages: Message[], task: Task): Promise<string> {
     const lastUserContent = messages.filter((m) => m.role === "user").at(-1)?.content;
-    const modelSize = pickModel(task, lastUserContent);
+    // P0-1 fix: follow-up chat turns always use the "large" equivalent endpoint
+    const userTurns = messages.filter((m) => m.role === "user").length;
+    // P0-1: when conversation has history, prefer the configured chat endpoint
+    // (which the user should configure to a capable model)
+    const effectiveTask: Task = (userTurns > 1 && task === "chat") ? "chat" : task;
 
-    let res: Response;
-    if (modelSize === "large") {
-        res = await llmFetchWithFallback(messages, false);
-    } else {
-        res = await llmFetch("small", messages, false);
-    }
+    const { temperature, max_tokens } = taskParams(effectiveTask);
+
+    const res = await fetchWithRetry({
+        model: "",
+        messages,
+        stream: false,
+        temperature,
+        max_tokens,
+        __task: effectiveTask,
+    } as ChatPayload & { __task: Task });
 
     const data = (await res.json()) as any;
     const choice = data.choices?.[0];
-    // A1: warn when the model was cut off mid-response (finish_reason "length" = token limit)
     if (choice?.finish_reason === "length") {
         warn("⚠ agent response was truncated (token limit hit) — output may be incomplete");
     }
     return stripThink(choice?.message?.content ?? "");
 }
-
-// ─── Exports for model info ───────────────────────────────────────────────────
-
-export { SMALL_MODEL, LARGE_MODEL };
-
-// Dummy type kept for backward compat (no longer used for routing)
-export type LLMService = "openrouter" | "clarifai" | "groq";

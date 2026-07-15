@@ -13,7 +13,8 @@
   },
   "include": [
     "cli/**/*",
-    "src/**/*"
+    "src/**/*",
+    "automation/**/*"
   ],
   "exclude": [
     "node_modules",

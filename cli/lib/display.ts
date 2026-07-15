@@ -64,7 +64,7 @@ process.once("SIGINT", () => {
 export function printHeader(command: string) {
     console.log();
     console.log(`  ${BRAND} ${ARROW} ${C.cyan(command)}`);
-    console.log(`  ${chalk.dim("dev environment agent · openrouter + groq")}`);
+    console.log(`  ${chalk.dim("dev environment agent · endpoints via fixd config")}`);
     console.log(`  ${SEP}`);
     console.log();
 }
@@ -296,7 +296,7 @@ export function agentSays(raw: string) {
 
     for (const block of blocks) {
         switch (block.tag) {
-            case "thought": renderThoughtBlock(block.content); break;
+            case "thought": break;
             case "text":    renderTextBlock(block.content);    break;
             case "prompt":  renderPromptBlock(block.content);  break;
             case "source":  renderSourceBlock(block.content);  break;

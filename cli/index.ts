@@ -14,15 +14,16 @@ dotenvConfig({ path: path.join(os.homedir(), ".fixd", ".env"),   override: false
 dotenvConfig({ path: path.resolve(__dirname, "../.env"),           override: false });
 dotenvConfig({ path: path.resolve(__dirname, "../.env.local"),     override: false });
 import chalk from "chalk";
-import { checkHealth, checkOpenRouterHealth } from "./lib/agent.js";
+import { checkAllEndpoints } from "./lib/agent.js";
+import { loadConfig, migrateLegacyConfig } from "./lib/endpoints.js";
 import {
     printHeader,
     error,
     info,
     spin,
     bye,
+    warn as displayWarn,
 } from "./lib/display.js";
-import { SMALL_MODEL, LARGE_MODEL } from "./lib/llm.js";
 import { checkForUpdate, getCurrentVersion } from "./lib/versionCheck.js";
 
 const VERSION = getCurrentVersion();
@@ -32,7 +33,7 @@ const VERSION = getCurrentVersion();
 function printHelp() {
     console.log();
     console.log(`  ${chalk.bold.white("fixd")} ${chalk.dim(`v${VERSION}`)}`);
-    console.log(`  ${chalk.dim("dev environment agent · powered by openrouter + groq")}`);
+    console.log(`  ${chalk.dim("dev environment agent · configure endpoints via fixd config")}`);
     console.log();
     console.log(`  ${chalk.bold("Usage:")}`);
     console.log(
@@ -54,7 +55,7 @@ function printHelp() {
         `    ${chalk.cyan("fixd init --yes")}      ${chalk.dim("scaffold with all defaults (hono + neon + prisma + bun)")}`
     );
     console.log(
-        `    ${chalk.cyan("fixd config")}          ${chalk.dim("manage API keys and configuration")}`
+        `    ${chalk.cyan("fixd config")}          ${chalk.dim("manage LLM endpoints and task routing")}`
     );
     console.log(
         `    ${chalk.cyan("fixd update")}          ${chalk.dim("update fixd to the latest npm version")}`
@@ -80,16 +81,12 @@ function printHelp() {
         `    ${chalk.cyan("--fast")}               ${chalk.dim("skip parallel sub-agents (doctor only)")}`
     );
     console.log();
-    console.log(`  ${chalk.bold("Env vars:")}`);
+    console.log(`  ${chalk.bold("Configuration:")}`);
     console.log(
-        `    ${chalk.cyan("FIXD_AUTO_RUN_LEVEL")}  ${chalk.dim("conservative | moderate (default) | aggressive")}`
+        `    ${chalk.cyan("fixd config")}              ${chalk.dim("manage LLM endpoints and task routing")}`
     );
     console.log(
-        `    ${chalk.cyan("FIXD_EXPLORE_MODEL")}   ${chalk.dim("small (default) | large — model for classifier/explore")}`
-    );
-    console.log();
-    console.log(
-        `  ${chalk.dim("Requires: ")}${chalk.white("OPENROUTER_API_KEY")} + ${chalk.white("GROQ_API_KEY")} ${chalk.dim("in ~/.config/fixd/.env")}`
+        `    ${chalk.dim("Config: ")}${chalk.white("~/.config/fixd/config.json")}`
     );
     console.log();
 }
@@ -98,12 +95,11 @@ function printConfigHelp() {
     console.log();
     console.log(`  ${chalk.bold.white("fixd config")}`);
     console.log();
-    console.log(`  ${chalk.bold("Examples:")}`);
-    console.log(`    ${chalk.cyan("fixd config")}                    ${chalk.dim("interactive setup wizard")}`);
-    console.log(`    ${chalk.cyan("fixd config list")}               ${chalk.dim("show all configured keys")}`);
-    console.log(`    ${chalk.cyan("fixd config set GROQ_API_KEY=sk-...")}`);
-    console.log(`    ${chalk.cyan("fixd config get GROQ_API_KEY")}`);
-    console.log(`    ${chalk.cyan("fixd config delete GROQ_API_KEY")}`);
+    console.log(`  ${chalk.bold("Commands:")}`);
+    console.log(`    ${chalk.cyan("fixd config")}                    ${chalk.dim("interactive endpoint manager")}`);
+    console.log(`    ${chalk.cyan("fixd config endpoints")}          ${chalk.dim("list configured endpoints")}`);
+    console.log(`    ${chalk.cyan("fixd config routing")}           ${chalk.dim("show task → endpoint routing")}`);
+    console.log(`    ${chalk.cyan("fixd config test <name>")}      ${chalk.dim("test an endpoint's connectivity")}`);
     console.log();
 }
 
@@ -113,31 +109,45 @@ async function runStatus() {
     checkForUpdate().catch(() => {});
     printHeader("status");
 
-    // Small model — Groq
-    const s1 = spin("checking Groq API...");
-    const groqOk = await checkHealth();
-    s1.stop();
-    if (groqOk) {
-        console.log(`  ${chalk.green("✔")} Groq API reachable`);
-    } else {
-        console.log(`  ${chalk.red("✖")} Groq API unreachable — check GROQ_API_KEY`);
+    // Auto-migrate legacy config on first run
+    const config = await loadConfig();
+    const migrated = await migrateLegacyConfig(config);
+    if (migrated) {
+        info("Migrated legacy provider config to endpoint-based config.");
+        info(`Config saved to ${path.join(os.homedir(), ".config", "fixd", "config.json")}`);
+        console.log();
     }
 
-    // Large model — OpenRouter (fix 10.2)
-    const s2 = spin("checking OpenRouter API...");
-    const orStatus = await checkOpenRouterHealth();
-    s2.stop();
-    if (orStatus === "ok") {
-        console.log(`  ${chalk.green("✔")} OpenRouter API reachable`);
-    } else if (orStatus === "no_key") {
-        console.log(`  ${chalk.yellow("⚠")} OpenRouter: OPENROUTER_API_KEY not set`);
-    } else {
-        console.log(`  ${chalk.red("✖")} OpenRouter API unreachable — check OPENROUTER_API_KEY`);
+    if (config.endpoints.length === 0) {
+        console.log(`  ${chalk.yellow("⚠")} No endpoints configured.`);
+        console.log(`  Run ${chalk.white("fixd config")} to set up LLM endpoints.`);
+        console.log();
+        return;
+    }
+
+    // Check each endpoint
+    const results = await checkAllEndpoints();
+    for (const r of results) {
+        const s = spin(`checking ${r.name}...`);
+        // Small delay for visual effect
+        await new Promise(resolve => setTimeout(resolve, 300));
+        s.stop();
+        if (r.ok) {
+            console.log(`  ${chalk.green("✔")} ${r.name} reachable`);
+        } else {
+            console.log(`  ${chalk.red("✖")} ${r.name}: ${r.error || "unreachable"}`);
+        }
     }
 
     console.log();
-    info(`small model : ${SMALL_MODEL}`);
-    info(`large model : ${LARGE_MODEL}`);
+    // Show routing table
+    info("task routing:");
+    for (const [task, route] of Object.entries(config.routing)) {
+        if (route.endpoint) {
+            console.log(`  ${chalk.dim(task.padEnd(12))} → ${chalk.white(route.endpoint)} / ${chalk.dim(route.model)}`);
+        }
+    }
+    console.log();
     info(`project     : ${process.cwd()}`);
     info(`config dir  : ${path.join(os.homedir(), ".config", "fixd")}`);
     console.log();
@@ -146,36 +156,38 @@ async function runStatus() {
 // ─── Pre-flight check ─────────────────────────────────────────────────────────
 
 async function preflight(): Promise<boolean> {
-    const key = process.env.GROQ_API_KEY;
-    if (!key) {
+    const config = await loadConfig();
+
+    // Auto-migrate legacy config
+    await migrateLegacyConfig(config);
+
+    // Reload config after migration
+    const currentConfig = await loadConfig();
+
+    if (currentConfig.endpoints.length === 0) {
         console.log();
-        error("GROQ_API_KEY is not set.");
-        info(`Add ${chalk.white("GROQ_API_KEY=<your-key>")} to your .env file.`);
-        info("Get a key at: https://console.groq.com/keys");
+        error("No LLM endpoints configured.");
+        info(`Run ${chalk.white("fixd config")} to set up endpoints.`);
+        info(`Config is stored in ${chalk.white("~/.config/fixd/config.json")}`);
+        console.log();
+        return false;
+    }
+
+    // Check that at least one endpoint is reachable
+    const results = await checkAllEndpoints();
+    const anyOk = results.some((r) => r.ok);
+    if (!anyOk) {
+        console.log();
+        error("Cannot reach any configured endpoints.");
+        info("Check your API keys and internet connection.");
+        info(`Run ${chalk.white("fixd status")} for details.`);
         console.log();
         return false;
     }
 
     // Context7 is optional — warn but never block startup
     if (!process.env.CONTEXT7_API_KEY) {
-        const { warn: displayWarn } = await import("./lib/display.js");
         displayWarn("CONTEXT7_API_KEY not set — live library docs unavailable");
-    }
-
-    const healthy = await checkHealth();
-    if (!healthy) {
-        console.log();
-        error("Cannot reach the Groq API.");
-        info("Check your GROQ_API_KEY or internet connection.");
-        console.log();
-        return false;
-    }
-
-    // R1: warn (don't block) if OPENROUTER_API_KEY is missing — large-model calls
-    // will fall through to Clarifai, so the CLI is still usable.
-    if (!process.env.OPENROUTER_API_KEY) {
-        const { warn: displayWarn } = await import("./lib/display.js");
-        displayWarn("OPENROUTER_API_KEY not set — large-model calls will fall back to Clarifai");
     }
 
     return true;
@@ -213,29 +225,22 @@ async function runUpdate() {
 async function runConfig(subcommand?: string, value?: string) {
     const {
         runConfigWizard,
-        runConfigSet,
-        runConfigGet,
         runConfigList,
-        runConfigDelete,
+        runConfigRouting,
+        runConfigTest,
     } = await import("./config.js");
 
     if (!subcommand) {
         await runConfigWizard();
     } else if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
         printConfigHelp();
-    } else if (subcommand === "list") {
-        runConfigList();
-    } else if (subcommand === "set") {
-        if (!value) { error("Usage: fixd config set KEY=VALUE"); process.exit(1); }
-        runConfigSet(value);
-    } else if (subcommand === "get") {
-        if (!value) { error("Usage: fixd config get KEY"); process.exit(1); }
-        runConfigGet(value);
-    } else if (subcommand === "delete") {
-        if (!value) { error("Usage: fixd config delete KEY"); process.exit(1); }
-        runConfigDelete(value);
-    } else if (subcommand.includes("=")) {
-        runConfigSet(subcommand);
+    } else if (subcommand === "list" || subcommand === "endpoints") {
+        await runConfigList();
+    } else if (subcommand === "routing") {
+        await runConfigRouting();
+    } else if (subcommand === "test") {
+        if (!value) { error("Usage: fixd config test <endpoint-name>"); process.exit(1); }
+        await runConfigTest(value);
     } else {
         error(`Unknown config subcommand: ${subcommand}. Run fixd config --help`);
         process.exit(1);

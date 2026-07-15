@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import path from "node:path";
+import fs from "node:fs";
 import { sendMessage, disconnect, setActiveProject, primeContext } from "./lib/agent.js";
 import { proposeAndApply, resetBackupSession } from "./lib/patcher.js";
 import { readRelevantFiles } from "./lib/projectReader.js";
@@ -13,6 +14,7 @@ import {
     recordStackPattern,
     type AppliedFix,
     type CausalEntry,
+    type ProjectMemory,
 } from "./lib/memory.js";
 import {
     detectLibrariesInProject,
@@ -303,6 +305,7 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
             type: `${e.stack.toUpperCase().replace(/\s+/g, "_")}_ERROR${e.code ? `_${e.code}` : ""}`,
             description: `${loc ? loc + " — " : ""}${e.message}`,
             autoFixable: false,
+            file: e.file,
         });
     }
 
@@ -526,9 +529,8 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
                 console.log();
             }
 
-            // Record applied fixes in memory
+            // Record applied fixes in memory (persisted at session end)
             currentMemory = recordFix(currentMemory, appliedFixes);
-            await saveMemory(currentMemory);
 
             if (manual.length > 0) {
                 section("manual fixes required");
@@ -604,9 +606,8 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
                         }
                     }
 
-                    // Update memory with post-fix scan
+                    // Update memory with post-fix scan (persisted at session end)
                     currentMemory = updateFromScan(currentMemory, scanAfter);
-                    await saveMemory(currentMemory);
                 }
             }
         }
@@ -633,7 +634,7 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
         if (["exit", "quit", "q", ":q"].includes(input.toLowerCase())) break;
 
         sessionLog.push(`you: ${input}`);
-        await agenticTurn(input, projectPath, 0, chatState, new Set(), projectLibraries, sessionLog, sessionChangedFiles, issues);
+        await agenticTurn(input, projectPath, 0, chatState, new Set(), projectLibraries, sessionLog, sessionChangedFiles, issues, currentMemory);
     }
     closePrompt();
 
@@ -687,6 +688,19 @@ function formatHypothesesBlock(hypotheses: Hypothesis[]): string {
 }
 
 function getErrorTypeFormatInstruction(userMessage: string, detectedIssues: DetectedIssue[]): string {
+    const hasMissingTypesTsError = detectedIssues.some((i) => {
+        const typeStr = (i.type || "").toUpperCase();
+        const descStr = (i.description || "").toLowerCase();
+        return typeStr.includes("TYPESCRIPT_ERROR") && 
+            (descStr.includes("missing type definitions") || 
+             descStr.includes("cannot find module") ||
+             descStr.includes("could not find a declaration file"));
+    });
+
+    if (hasMissingTypesTsError) {
+        return "FORMAT: ALWAYS fix missing @types by running the package manager install command (e.g., npm install --save-dev @types/...). NEVER write .d.ts stub files. Zero prose.";
+    }
+
     const issueTypes = detectedIssues.map((i) => i.type);
 
     if (issueTypes.includes("MISSING_DATABASE_URL") || issueTypes.includes("PRISMA_POOLED_WITHOUT_DIRECT_URL")) {
@@ -763,7 +777,8 @@ async function agenticTurn(
     projectLibraries: string[],
     sessionLog: string[],
     sessionChangedFiles: string[],
-    detectedIssues: DetectedIssue[] = []
+    detectedIssues: DetectedIssue[] = [],
+    currentMemory?: ProjectMemory,
 ): Promise<void> {
     state.currentDepth = depth;
 
@@ -792,8 +807,23 @@ async function agenticTurn(
     if (depth === 0) {
         const readSpinner = spin("reading project files...");
         const issueTypes = detectedIssues.map((i) => i.type);
-        fileContext = await readRelevantFiles(userMessage, projectRoot, issueTypes).catch(() => "");
+        fileContext = await readRelevantFiles(userMessage, projectRoot, issueTypes, detectedIssues).catch(() => "");
         readSpinner.stop();
+    }
+
+    // In agenticTurn(), at depth 0 AND depth > 0 for error files:
+    const errorFiles = detectedIssues
+        .map((i) => i.file)
+        .filter((f): f is string => typeof f === "string")
+        .filter((f, idx, arr) => arr.indexOf(f) === idx); // dedupe
+
+    let errorFileContents = "";
+    for (const relPath of errorFiles) {
+        const absPath = path.join(projectRoot, relPath);
+        if (fs.existsSync(absPath)) {
+            const content = fs.readFileSync(absPath, "utf-8");
+            errorFileContents += `\n--- FILE: ${relPath} ---\n${content}\n--- END FILE ---\n`;
+        }
     }
 
     // ── Per-error-type format instructions (Change 3) ─────────────────────────
@@ -803,6 +833,7 @@ async function agenticTurn(
     // ── Build enriched message ────────────────────────────────────────────────
     const parts: string[] = [];
     if (fileContext) parts.push(fileContext);
+    if (errorFileContents) parts.push(errorFileContents);
     parts.push(`[Working directory: ${projectRoot}]`);
     parts.push("");
     parts.push(userMessage);
@@ -852,7 +883,7 @@ async function agenticTurn(
         if (skipKeys.size > 0) {
             await agenticTurn(
                 "[Skipped: identical fix already attempted for this location. Try a different approach.]",
-                projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues
+                projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues, currentMemory
             );
             return;
         }
@@ -899,19 +930,16 @@ async function agenticTurn(
                 .filter((a) => !issuesBefore.some((b) => b.type === a.type))
                 .map((i) => i.type);
 
-            // IMPROVEMENT 6 fix: load memory ONCE, accumulate all causal entries
-            // and stack pattern updates, then save ONCE after the loop.
-            // Previously each patch triggered a full loadMemory→saveMemory cycle
-            // (N reads + N writes for N patches). Now it's always 1 read + 1 write.
-            const mem = await loadMemory(projectRoot).catch(() => null);
-            if (mem) {
+            // P1 fix: mutate the in-memory ProjectMemory directly instead of
+            // loading from disk + saving to disk on every recursion. Memory is
+            // persisted once at session end (runDoctor line ~644).
+            if (currentMemory) {
                 const allIssueTypes  = [...new Set(issuesBefore.map((i) => i.type))];
                 const primaryIssue   = allIssueTypes[0] ?? "UNKNOWN";
                 const issueTypeLabel = allIssueTypes.join("|") || "UNKNOWN";
                 const outcomeLabel   = outcome === "resolved" ? "resolved"
                                      : outcome === "regression" ? "regression" : "no_change";
 
-                let current = mem;
                 for (const p of applied) {
                     const causalEntry: CausalEntry = {
                         timestamp:     new Date().toISOString(),
@@ -921,27 +949,25 @@ async function agenticTurn(
                         outcome:       outcomeLabel,
                         followupIssues,
                     };
-                    current = addCausalEntry(current, causalEntry);
+                    currentMemory = addCausalEntry(currentMemory, causalEntry);
                 }
-                // Record stack pattern once (represents the whole batch)
-                current = recordStackPattern(
-                    current,
-                    mem.knownStack,
+                currentMemory = recordStackPattern(
+                    currentMemory,
+                    currentMemory.knownStack,
                     primaryIssue,
                     claim.slice(0, 120),
                     outcome === "resolved" ? "success" : "failure"
                 );
-                await saveMemory(current).catch(() => {});
             }
 
             // Change 2c: outcome-based routing
             if (outcome === "resolved") {
                 const msg = `[Fix Outcome: FIXED — ${Math.abs(delta)} issue(s) resolved]\nApplied ${applied.length} change(s), verify remaining issues.`;
-                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues);
+                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues, currentMemory);
             } else if (outcome === "no_change") {
                 const hypoLog = formatHypothesesBlock(state.hypotheses);
                 const msg = `[Fix Outcome: NO CHANGE — fix had no effect]\n${hypoLog}\nThe previous fix had no effect. Review the hypothesis log above. Form a completely different hypothesis and try again, or explain why this cannot be fixed automatically.`;
-                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues);
+                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues, currentMemory);
             } else {
                 const newIssueList = newIssues
                     .filter((a) => !issuesBefore.some((b) => b.type === a.type))
@@ -949,7 +975,7 @@ async function agenticTurn(
                     .join("\n");
                 const hypoLog = formatHypothesesBlock(state.hypotheses);
                 const msg = `[Fix Outcome: REGRESSION — ${Math.abs(delta)} new issue(s) introduced]\nNew issues:\n${newIssueList}\n${hypoLog}\nThe fix made things worse. Reassess completely.`;
-                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues);
+                await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues, currentMemory);
             }
             return;
         }
@@ -980,7 +1006,7 @@ async function agenticTurn(
                 const result = await runCommand(cmd.command, projectRoot);
                 runSpinner.stop();
                 if (result.exitCode !== 0) printCommandResult(result);
-                await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues);
+                await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues, currentMemory);
                 return; // ← was: continue
             }
 
@@ -990,7 +1016,7 @@ async function agenticTurn(
             if (!approved) {
                 await agenticTurn(
                     `[User declined to run: \`${cmd.command}\`]. Propose alternative or explain manual steps.`,
-                    projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues
+                    projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues, currentMemory
                 );
                 return; // ← was: continue
             }
@@ -999,8 +1025,16 @@ async function agenticTurn(
             const result = await runCommand(cmd.command, projectRoot);
             runSpinner.stop();
             printCommandResult(result);
-            await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues);
+            await agenticTurn(formatResultForAgent(result), projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues, currentMemory);
             return; // stop after first command; recursion handles all follow-up
         }
     }
 }
+
+export const __doctorTest = {
+    makeSessionState,
+    formatHypothesesBlock,
+    generateStuckReport,
+    computeFixOutcome,
+    agenticTurn,
+};

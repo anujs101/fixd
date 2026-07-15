@@ -175,6 +175,9 @@ export async function loadMemory(projectRoot: string): Promise<ProjectMemory> {
 
 /** Atomically write memory to .fixd/memory.json. Never throws. */
 export async function saveMemory(memory: ProjectMemory): Promise<void> {
+    memory.fixedIssues = (memory.fixedIssues ?? []).slice(-MAX_FIXED_ISSUES);
+    memory.causalChain = (memory.causalChain ?? []).slice(-MAX_CAUSAL_ENTRIES);
+    memory.chatSummaries = (memory.chatSummaries ?? []).slice(-MAX_CHAT_SUMMARIES);
     pruneStackPatterns(memory);
 
     try {

@@ -36,7 +36,8 @@ const CODE_EXTENSIONS = [
 async function scoreFileRelevance(
     query: string,
     candidateFiles: string[],
-    detectedIssueTypes: string[]
+    detectedIssueTypes: string[],
+    explicitFiles: string[] = []
 ): Promise<string[]> {
     if (candidateFiles.length <= 5) return candidateFiles; // not worth a model call
 
@@ -50,6 +51,8 @@ Files: ${candidateFiles.join(", ")}
 
 Reply with ONLY a JSON array of relevant file paths. Maximum 8 files. If none are relevant, return [].
 Example: ["src/index.ts", "prisma/schema.prisma"]`;
+
+    const normExplicit = new Set(explicitFiles.map(normRelPath));
 
     try {
         const response = await ask(prompt, "classify");
@@ -66,27 +69,24 @@ Example: ["src/index.ts", "prisma/schema.prisma"]`;
             .filter((f) => normCandidates.has(f))
             // Map normalised path back to the original candidate spelling
             .map((f) => candidateFiles.find((c) => normRelPath(c) === f) ?? f);
+
+        // Ensure explicit files in candidates are always included in filtered
+        for (const cand of candidateFiles) {
+            if (normExplicit.has(normRelPath(cand)) && !filtered.includes(cand)) {
+                filtered.push(cand);
+            }
+        }
         return filtered.length > 0 ? filtered : candidateFiles;
     } catch {
         return candidateFiles;
     }
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-/**
- * Read files relevant to the given user query and return them as a formatted
- * string block ready for injection into the agent context.
- *
- * issueTypes — optional list of detected issue type strings (e.g. "MISSING_DATABASE_URL")
- * used to focus the file relevance scoring step.
- *
- * Returns an empty string if nothing could be read.
- */
 export async function readRelevantFiles(
     query: string,
     projectRoot: string,
     issueTypes: string[] = [],
+    detectedIssues: Array<{ file?: string }> = [],
 ): Promise<string> {
     const sections: string[] = [];
     let totalChars = 0;
@@ -122,13 +122,20 @@ export async function readRelevantFiles(
     }
 
     // CLI-specific queries
-    if (/\b(cli|command|doctor|init|deploy)\b/.test(q)) {
+    if (/\b(cli|command|doctor|init|deploy|agent)\b/.test(q)) {
         candidatePaths.push(...await listFiles(path.join(projectRoot, "cli"), CODE_EXTENSIONS));
     }
 
-    // LLM / model / groq / clarifai queries
-    if (/\b(llm|model|groq|clarifai|ai|inference)\b/.test(q)) {
+    // LLM / model / endpoint / ai / inference queries
+    if (/\b(llm|model|endpoint|ai|inference|api key)\b/.test(q)) {
         candidatePaths.push(...await listFiles(path.join(projectRoot, "cli/lib"), CODE_EXTENSIONS));
+    }
+
+    // Unconditionally include all explicit files from detectedIssues as candidate paths
+    const explicitFiles = detectedIssues.map((i) => i.file).filter(Boolean) as string[];
+    for (const f of explicitFiles) {
+        const absPath = path.isAbsolute(f) ? f : path.join(projectRoot, f);
+        candidatePaths.push(absPath);
     }
 
     // ── Dedupe candidate paths (relative), then relevance-score ───────────────
@@ -137,15 +144,23 @@ export async function readRelevantFiles(
     const relCandidates = uniquePaths.map((p) => path.relative(projectRoot, p));
 
     // Change 7: score file relevance — skip model call if too few candidates
-    const relevantRel = await scoreFileRelevance(query, relCandidates, issueTypes);
+    const relevantRel = await scoreFileRelevance(query, relCandidates, issueTypes, explicitFiles);
     // Use normalised paths so LLM-returned './src/foo.ts' matches 'src/foo.ts'
     const relevantSet = new Set(relevantRel.map(normRelPath));
+    const normExplicit = new Set(explicitFiles.map(normRelPath));
 
     for (const filePath of uniquePaths) {
         if (totalChars >= CHAR_LIMIT) break;
         const rel = path.relative(projectRoot, filePath);
         if (seen.has(rel)) continue;
-        if (relCandidates.length > 5 && !relevantSet.has(normRelPath(rel))) continue; // filtered out
+        const normalisedRel = normRelPath(rel);
+        if (
+            relCandidates.length > 5 &&
+            !relevantSet.has(normalisedRel) &&
+            !normExplicit.has(normalisedRel)
+        ) {
+            continue; // filtered out
+        }
         seen.add(rel);
 
         const content = await safeRead(filePath);
@@ -173,7 +188,7 @@ export async function readRelevantFiles(
  * - call path.normalize() for OS-agnostic separators
  * This makes relevantSet.has() robust to LLM-returned path variations.
  */
-function normRelPath(p: string): string {
+export function normRelPath(p: string): string {
     return path.normalize(p).replace(/^[.][/\\]/, "");
 }
 

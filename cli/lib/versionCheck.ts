@@ -12,7 +12,15 @@ interface VersionCache {
     latestVersion: string;
 }
 
+// Bun compile injects this at build time via --define
+declare var FIXD_BUILD_VERSION: string | undefined;
+
 function readPackageVersion(): string {
+    // Bun compiled binary: use injected version constant
+    if (typeof FIXD_BUILD_VERSION === "string" && FIXD_BUILD_VERSION.length > 0) {
+        return FIXD_BUILD_VERSION;
+    }
+
     const candidates = [
         new URL("../../package.json", import.meta.url),
         new URL("../../../package.json", import.meta.url),

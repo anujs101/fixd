@@ -253,6 +253,7 @@ export interface DetectedIssue {
   description: string;
   autoFixable: boolean;
   fix?: () => Promise<FixResult>;
+  file?: string;
 }
 
 export function detectIssues(scan: ProjectScan, projectPath: string): DetectedIssue[] {

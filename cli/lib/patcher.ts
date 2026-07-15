@@ -106,7 +106,8 @@ export function parsePatchOperations(agentText: string): ParseResult {
     const parseErrors: string[] = [];
 
     // ── <<<WRITE: path>>> ... <<<END>>> ──────────────────────────────────────
-    const writeRe = /<<<WRITE:\s*([^\n>]+)>>>\n([\s\S]*?)<<<END>>>/g;
+    // Note: \s* after >>> because some models don't output newlines (endpoint refactor regression fix)
+    const writeRe = /<<<WRITE:\s*([^\n>]+)>>>\s*([\s\S]*?)<<<END>>>/g;
     let m: RegExpExecArray | null;
     while ((m = writeRe.exec(agentText)) !== null) {
         const filePath = m[1].trim();
@@ -116,7 +117,7 @@ export function parsePatchOperations(agentText: string): ParseResult {
     }
 
     // ── <<<EDIT: path>>> <<<SEARCH>>> ... <<<REPLACE>>> ... <<<END>>> ────────
-    const editRe = /<<<EDIT:\s*([^\n>]+)>>>\n<<<SEARCH>>>\n([\s\S]*?)<<<REPLACE>>>\n([\s\S]*?)<<<END>>>/g;
+    const editRe = /<<<EDIT:\s*([^\n>]+)>>>\s*<<<SEARCH>>>\s*([\s\S]*?)<<<REPLACE>>>\s*([\s\S]*?)<<<END>>>/g;
     while ((m = editRe.exec(agentText)) !== null) {
         const filePath = m[1].trim();
         const search   = m[2].trimEnd();
@@ -230,7 +231,13 @@ function findSearchIndex(fileLines: string[], searchLines: string[]): number {
 }
 
 function normalizeWs(s: string): string {
-    return s.replace(/\r\n/g, "\n").replace(/\t/g, "    ").trimEnd();
+    return s
+        .replace(/\r\n/g, "\n")
+        .replace(/\t/g, "    ")
+        .split("\n")
+        .map((line) => line.trimEnd())
+        .join("\n")
+        .trimEnd();
 }
 
 // ─── JSON-aware patch helpers ────────────────────────────────────────────────

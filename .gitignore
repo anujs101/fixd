@@ -43,9 +43,10 @@ next-env.d.ts
 
 .mastra
 .fixd/
-
+.claude/*
 # compiled binaries
 fixd
+fixd2
 dist/
 build/
 /.pnp
@@ -98,3 +99,4 @@ bun.lockb
 Prompt.md
 /claudeCode_system_prompt
 CONTEXT.md
+prompt.md
