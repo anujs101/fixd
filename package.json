@@ -9,6 +9,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
+    "acceptance": "vitest run --config vitest.acceptance.config.ts --no-file-parallelism",
     "prepublishOnly": "npm run build"
   },
   "bin": {
