@@ -1,6 +1,7 @@
 import chalk from "chalk";
 import path from "node:path";
 import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 import { sendMessage, disconnect, setActiveProject, primeContext } from "./lib/agent.js";
 import { proposeAndApply, resetBackupSession } from "./lib/patcher.js";
 import { readRelevantFiles } from "./lib/projectReader.js";
@@ -16,6 +17,10 @@ import {
     type CausalEntry,
     type ProjectMemory,
 } from "./lib/memory.js";
+import { discoverStack } from "./lib/discovery.js";
+import { loadAllCheckers, filterByStack } from "./lib/checker-loader.js";
+import { buildIssueGraph, formatGraphForPrompt } from "./lib/issue-graph.js";
+import type { CheckerPlugin, CheckerResult } from "./lib/checker-types.js";
 import {
     detectLibrariesInProject,
     fetchDocsForQuery,
@@ -319,15 +324,134 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
     section("issues found");
     printDetectedIssues(issues);
 
-    // ── Phase 3: parallel sub-agents analyse with REAL scan data ────────────────
+    // ── Phase 3a: Deterministic checker plugins (ADR-0003) ─────────────────
+    // Run applicable checker plugins against the discovered stack.
+    // Checkers find compile errors, schema issues, env problems, etc.
+    // The LLM receives verified results — it never rediscovers what
+    // deterministic tools already know.
+
+    const knownStack = discoverStack(projectPath, currentMemory.knownStack as any);
+    currentMemory = { ...currentMemory, knownStack: knownStack as any };
+    await saveMemory(currentMemory);
+
+    // Resolve checker directory: try dist/checkers, then source checkers/
+    const srcDir = path.dirname(fileURLToPath(import.meta.url));
+    const checkerDir = path.resolve(srcDir, "..", "..", "checkers");
+    let allPlugins: CheckerPlugin[] = [];
+    let checkerResults: CheckerResult[] = [];
+    let checkerGraph: ReturnType<typeof buildIssueGraph> | null = null;
+
+    try {
+      allPlugins = await loadAllCheckers(checkerDir);
+      if (allPlugins.length === 0) {
+        // Fallback: try source directory (when running via tsx)
+        const altDir = path.resolve(srcDir, "..", "checkers");
+        allPlugins = await loadAllCheckers(altDir);
+      }
+      const activePlugins = filterByStack(allPlugins, knownStack);
+
+      if (activePlugins.length > 0) {
+        const checkerSpinner = spin(`running ${activePlugins.length} checker(s)...`);
+        checkerResults = await Promise.all(
+          activePlugins.map(p => p.check(projectPath).catch((err: Error) => ({
+            checker: p.id, category: p.category, passed: false,
+            errors: [{ file: undefined, line: undefined, col: undefined, code: "CHECKER_ERROR", severity: "error" as const, message: `Checker ${p.id} failed: ${err.message}`, raw: err.message }],
+            warnings: [], skipped: true, skipReason: err.message, durationMs: 0,
+          })))
+        );
+        checkerSpinner.stop();
+
+        // Build issue graph
+        checkerGraph = buildIssueGraph(checkerResults, activePlugins);
+
+        // Display checker results
+        const passed = checkerResults.filter(r => r.passed && !r.skipped).length;
+        const failed = checkerResults.filter(r => !r.passed).length;
+        const skipped = checkerResults.filter(r => r.skipped).length;
+        section("checkers");
+        info(`${passed} passed, ${failed} failed, ${skipped} skipped`);
+
+        for (const r of checkerResults) {
+          if (r.skipped) continue;
+          const icon = r.passed ? chalk.green("✔") : chalk.red("✖");
+          console.log(`  ${icon} ${r.checker}: ${r.errors.length} error(s), ${r.warnings.length} warning(s) (${r.durationMs}ms)`);
+        }
+
+        // ── Severity-tiered display (Improvement 3) ─────────────────────────
+        if (checkerGraph && checkerGraph.nodes.length > 0) {
+          console.log();
+          const errors = checkerGraph.nodes.filter(n => n.severity === "HIGH");
+          const warnings = checkerGraph.nodes.filter(n => n.severity === "MEDIUM");
+          const suggestions = checkerGraph.nodes.filter(n => n.severity === "LOW");
+
+          if (errors.length > 0) {
+            console.log(`  ${chalk.red("Errors")} (${errors.length})`);
+            for (const e of errors.slice(0, 10)) {
+              const loc = e.file ? ` ${chalk.dim(e.file + (e.line ? `:${e.line}` : ""))}` : "";
+              console.log(`    ${chalk.red("✖")} [${e.category}] ${e.message.slice(0, 100)}${loc}`);
+            }
+          }
+          if (warnings.length > 0) {
+            console.log(`  ${chalk.yellow("Warnings")} (${warnings.length})`);
+            for (const w of warnings.slice(0, 5)) {
+              const loc = w.file ? ` ${chalk.dim(w.file + (w.line ? `:${w.line}` : ""))}` : "";
+              console.log(`    ${chalk.yellow("⚠")} [${w.category}] ${w.message.slice(0, 100)}${loc}`);
+            }
+          }
+          if (suggestions.length > 0) {
+            console.log(`  ${chalk.dim("Suggestions")} (${suggestions.length})`);
+            for (const s of suggestions.slice(0, 3)) {
+              console.log(`    ${chalk.dim("·")} [${s.category}] ${s.message.slice(0, 100)}`);
+            }
+          }
+
+          // Show root causes separately
+          if (checkerGraph.rootCauses.length > 0) {
+            console.log();
+            info(`${chalk.white(checkerGraph.rootCauses.length)} root cause(s) — fixing these resolves downstream issues`);
+          }
+
+          // Execution plan (Improvement 5)
+          if (errors.length > 0 && checkerGraph.rootCauses.length > 0) {
+            console.log();
+            section("execution plan");
+            const estimateEdits = Math.min(checkerGraph.rootCauses.length * 2, 20);
+            const categories = [...new Set(checkerGraph.rootCauses.map(rc => rc.category))];
+            for (let i = 0; i < categories.length; i++) {
+              const catIssues = checkerGraph.rootCauses.filter(rc => rc.category === categories[i]);
+              console.log(`  ${chalk.cyan(`Phase ${i + 1}`)}  ${catIssues[0]?.category}`);
+              console.log(`    ${chalk.dim("✓")} ${catIssues[0]?.message.slice(0, 80)}`);
+            }
+            console.log();
+            console.log(`  ${chalk.dim("Estimated:")}`);
+            console.log(`  ${chalk.dim("·")} ${checkerGraph.rootCauses.length} root cause(s)`);
+            console.log(`  ${chalk.dim("·")} ~${estimateEdits} edit(s)`);
+            console.log(`  ${chalk.dim("·")} ${categories.length} checker(s) will be re-run`);
+            console.log();
+          }
+        }
+        console.log();
+      }
+    } catch (err: any) {
+      warn(`Checker system unavailable: ${err.message}`);
+    }
+
+    // ── Phase 3b: LLM analysis ──────────────────────────────────────────
+    // The LLM receives the verified checker results as structured input.
+    // Its job: explain root causes, coordinate fixes, reason about architecture.
+    // It should NEVER rediscover what deterministic checkers already found.
+
     const scanContext = buildScanContext(projectPath, scan, diagContext);
     const issueList = issues.length > 0
         ? issues.map((i) => `- [${i.severity}] ${i.type}: ${i.description}`).join("\n")
         : "No issues detected.";
 
-    const diagSpinner = spin(fast ? "agent analysing..." : "running parallel analysis...");
+    // Build enriched prompt with checker results
+    const checkerContext = checkerGraph
+      ? formatGraphForPrompt(checkerGraph, Object.keys(knownStack.signals).join(", "))
+      : "";
 
-    let diagResponseText: string;
+    const diagSpinner = spin(fast ? "agent analysing..." : "running parallel analysis...");
 
     if (fast) {
         // ── FAST MODE: single sequential LLM call (old behaviour) ────────────
@@ -338,6 +462,9 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
             "```",
             scanContext,
             "```",
+            ``,
+            ``,
+            checkerContext,
             ``,
             `DETECTED ISSUES (${issues.length} total):`,
             issueList,
@@ -370,6 +497,9 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
             `- If TYPESCRIPT CHECK says PASSED, TypeScript is FINE — do NOT mention tsconfig issues`,
             `- Only mention issues that appear in the DETECTED ISSUES list above`,
             `- Max 1 sentence per PROBLEM and FIX field`,
+            `- PREFER EDITING EXISTING FILES: inspect current content before generating new files`,
+            `- Only create new files when they genuinely do not exist on disk`,
+            `- Patch existing code rather than rewriting from scratch`,
         ].join("\n");
 
         const diagResponse = await sendMessage(diagPrompt, "diagnose").catch((err: any) => {
@@ -611,6 +741,75 @@ export async function runDoctor(cwd?: string, fast = false, plan = false) {
                 }
             }
         }
+    }
+
+    // ── Phase 4b: Automatic verification loop (Improvement 2) ──────────────
+    // After fixes, re-run affected checkers. If issues remain, send to LLM.
+    // The user never has to type "there are still errors."
+    if (checkerResults.length > 0 && checkerGraph && checkerGraph.rootCauses.length > 0) {
+      const MAX_VERIFY_ITERATIONS = 3;
+      for (let iter = 1; iter <= MAX_VERIFY_ITERATIONS; iter++) {
+        const verifySpinner = spin(`verification round ${iter}/${MAX_VERIFY_ITERATIONS}...`);
+
+        // Refresh project state (Improvement 6)
+        try {
+          const freshScan = await scanProject(projectPath).catch(() => null);
+          if (freshScan) {
+            scan = freshScan;
+            currentMemory = updateFromScan(currentMemory, scan);
+          }
+          const freshStack = discoverStack(projectPath, currentMemory.knownStack as any);
+          currentMemory = { ...currentMemory, knownStack: freshStack as any };
+        } catch { /* scan failure is non-fatal */ }
+
+        // Re-run applicable checkers
+        const activePlugins = filterByStack(allPlugins, currentMemory.knownStack as any);
+        const freshResults = await Promise.all(
+          activePlugins.map(p => p.check(projectPath).catch((err: Error) => ({
+            checker: p.id, category: p.category, passed: false,
+            errors: [{ file: undefined, line: undefined, col: undefined, code: "CHECKER_ERROR", severity: "error" as const, message: err.message, raw: err.message }],
+            warnings: [], skipped: true, skipReason: err.message, durationMs: 0,
+          })))
+        );
+
+        const freshGraph = buildIssueGraph(freshResults, activePlugins);
+        verifySpinner.stop();
+
+        // Display refreshed state
+        const remainingErrors = freshGraph.rootCauses.filter(n => n.severity === "HIGH").length;
+        const remainingTotal = freshGraph.rootCauses.length;
+
+        if (remainingTotal === 0) {
+          success(`verification round ${iter}: project is clean`);
+          checkerResults = freshResults;
+          checkerGraph = freshGraph;
+          break;
+        }
+
+        info(`verification round ${iter}: ${remainingErrors} error(s), ${remainingTotal - remainingErrors} warning(s) remain`);
+
+        // Send remaining issues to LLM for another fix round
+        if (iter < MAX_VERIFY_ITERATIONS) {
+          const remainingReport = formatGraphForPrompt(freshGraph, Object.keys((currentMemory.knownStack as any)?.signals ?? {}).join(", "));
+          const fixPrompt = [
+            `[Automatic verification round ${iter} — ${remainingTotal} issue(s) remain]`,
+            remainingReport,
+            ``,
+            `Fix ALL remaining issues. Output patches directly. No conversational text.`,
+            `Prefer editing existing files over creating new ones.`,
+          ].join("\n");
+
+          const fixResponses = await sendMessage(fixPrompt, "diagnose").catch(() => [] as any[]);
+          for (const msg of fixResponses) {
+            const cleanText = (msg.text ?? "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+            if (!cleanText.includes("<<<WRITE:") && !cleanText.includes("<<<EDIT:")) continue;
+            await proposeAndApply(cleanText, projectPath, { confirmEach: false });
+          }
+        }
+
+        checkerResults = freshResults;
+        checkerGraph = freshGraph;
+      }
     }
 
     // ── Phase 5: interactive chat with agentic execution loop ──────────────────────

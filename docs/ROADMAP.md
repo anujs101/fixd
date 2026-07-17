@@ -14,6 +14,18 @@
 - ✅ **ADR-0001**: Internal automation layer design documented
 - ✅ **Endpoint Abstraction**: Provider-centric → endpoint-centric architecture. Any OpenAI-compatible, Anthropic, Gemini, or Ollama endpoint works. Config via `~/.config/fixd/config.json`. Auto-migration from legacy env vars. ADR-0002.
 - ✅ **ADR-0002**: Endpoint abstraction layer design documented
+- ✅ **ADR-0003**: Plugin checker architecture designed (Discovery Engine, Issue Dependency Graph, Doctor as orchestrator)
+
+## Immediate (Next 1-2 sprints)
+
+### Plugin Checker System (ADR-0003)
+- **Discovery Engine** — Centralized stack detection from config files, deps, dirs, framework files
+- **Checker plugins** — Migrate existing `STACK_CHECKERS` to `checkers/*/plugin.ts`
+- **New checkers** — env, prisma, react-vite, dependencies, git, docker, package-json
+- **Issue Dependency Graph** — Build DAG from checker deps, file overlap, import graph, category ordering
+- **Doctor as orchestrator** — Remove framework-specific code from doctor.ts
+- **Verification loop** — Re-run affected checkers after fixes, zero user prompting
+- **exploreProject() repurposed** — Architecture reasoning, not error discovery
 
 ## Immediate (Next 1-2 sprints)
 
@@ -38,16 +50,14 @@
 - **`fixd review`** — Pre-commit code review using diagnostic engine + LLM
 
 ### Architecture
-- **Plugin system for issue detectors** — Currently `detectIssues()` has 7
-  hardcoded types. Community plugins for specific frameworks
-- **Plugin system for diagnostic checkers** — Community checkers for new
-  languages without forking
+- **Additional checker plugins** — Community-contributed checkers for
+  Remix, SvelteKit, tRPC, Django, Rails, Flutter, etc.
+- **Plugin distribution** — npm-published checker plugins installable
+  via `fixd plugin add <name>`
 
 ### Performance
 - **Stream sub-agent responses** — Real-time diagnosis display instead of
   spinner-then-dump
-- **Cache project scans** — mtime-based invalidation to avoid re-reading
-  files on every `agenticTurn()` recursion
 - **Increase test coverage** — Core functions need better integration coverage
 
 ## Long-Term (3-6 months)

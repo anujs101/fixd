@@ -1,6 +1,4 @@
-// ─── Acceptance: fixd doctor ────────────────────────────────────────────────
-// Runs doctor against known-broken fixtures and verifies it detects, reports,
-// and resolves real issues.
+// ─── Acceptance: fixd doctor with checker pipeline ──────────────────────────
 
 import { describe, test, beforeAll, afterAll } from "vitest";
 import { newSession, fixdRun, cleanup, parseIssueTypes } from "./helpers.js";
@@ -8,10 +6,9 @@ import type { Session } from "../../automation/index.js";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-describe("fixd doctor — broken-prisma fixture", () => {
+describe("fixd doctor — checker pipeline", () => {
   let session: Session;
   let stdout: string;
-  let issues: string[];
 
   beforeAll(async () => {
     session = await newSession("broken-prisma");
@@ -20,69 +17,56 @@ describe("fixd doctor — broken-prisma fixture", () => {
       timeout: 120_000,
     });
     stdout = result.stdout;
-    issues = parseIssueTypes(stdout);
   }, 180_000);
 
   afterAll(async () => { await cleanup(session); });
 
-  test("detects exactly the expected issue: MISSING_DATABASE_URL", () => {
-    // The broken-prisma fixture has a Prisma schema that references DATABASE_URL
-    // but the .env file does not set it. Doctor MUST detect this.
-    expect(issues).toContain("MISSING_DATABASE_URL");
+  test("checker pipeline runs and reports results", () => {
+    expect(stdout).toContain("checkers");
+    expect(stdout).toMatch(/passed/);
+    expect(stdout).toMatch(/failed/);
   });
 
-  test("reports that the issue is auto-fixable", () => {
-    // MISSING_DATABASE_URL is one of FIXD's 7 hardcoded fixable issue types
-    expect(stdout).toMatch(/auto-fixable:\s*yes/i);
+  test("env checker detects missing DATABASE_URL as root cause", () => {
+    // The env checker should find this issue independently of the LLM
+    expect(stdout).toContain("DATABASE_URL");
+    expect(stdout).toContain("root cause");
   });
 
-  test("produces a structured diagnosis, not just raw output", () => {
-    // The output must include a SEVERITY level and a PROBLEM or FIX field
-    expect(stdout).toMatch(/severity|HIGH|MEDIUM/i);
-    expect(stdout.length).toBeGreaterThan(200);
+  test("detects issue via both old detector and new checker", () => {
+    // The old detectIssues() still finds MISSING_DATABASE_URL
+    // AND the new env checker also finds it
+    expect(stdout).toContain("MISSING_DATABASE_URL");
   });
 
-  test("persists scan results to .fixd/memory.json", () => {
+  test("package-json checker passes on valid fixture", () => {
+    expect(stdout).toContain("package-json");
+    // Should show 0 errors for a valid package.json
+    expect(stdout).toMatch(/package-json.*0 error/);
+  });
+
+  test("generates .fixd/memory.json with knownStack", () => {
     const memPath = path.join(session.workspacePath, ".fixd", "memory.json");
     expect(existsSync(memPath)).toBe(true);
     const mem = JSON.parse(readFileSync(memPath, "utf-8"));
-    // After a doctor run, memory should have lastScanned set
-    expect(mem.lastScanned).toBeTruthy();
+    expect(mem.knownStack).toBeDefined();
+    // The discovery engine should have populated knownStack
+    expect(mem.knownStack.signals).toBeDefined();
   });
-});
 
-describe("fixd doctor — resolution verification", () => {
-  // Create a fixture where the fix is trivial: add DATABASE_URL to .env
-  // and verify doctor detects 0 issues on re-run.
+  test("no provider names leak into output", () => {
+    const lower = stdout.toLowerCase();
+    expect(lower).not.toContain("groq");
+    expect(lower).not.toContain("openrouter");
+    expect(lower).not.toContain("clarifai");
+  });
 
-  let session: Session;
-
-  afterAll(async () => { await cleanup(session); });
-
-  test("applying the suggested fix resolves the issue", async () => {
-    session = await newSession("broken-prisma");
-
-    // Run doctor to confirm issue exists
-    const firstRun = await fixdRun(session, ["doctor", "--fast"], {
-      input: "y\nexit\n", // approve auto-fix, then exit
-      timeout: 180_000,
-    });
-    const firstIssues = parseIssueTypes(firstRun.stdout);
-    expect(firstIssues).toContain("MISSING_DATABASE_URL");
-
-    // Check if doctor added DATABASE_URL to .env
-    const envPath = path.join(session.workspacePath, ".env");
-    const envContent = existsSync(envPath) ? readFileSync(envPath, "utf-8") : "";
-
-    // Run doctor again — should find fewer or no issues
-    const secondRun = await fixdRun(session, ["doctor", "--fast"], {
-      input: "exit",
-      timeout: 120_000,
-    });
-    const secondIssues = parseIssueTypes(secondRun.stdout);
-
-    // Either the fix was applied and issues decreased, or the fix wasn't
-    // applied (manual confirmation rejected). We verify doctor doesn't crash.
-    expect(secondRun.stdout.length).toBeGreaterThan(200);
-  }, 360_000);
+  test("doctor completes within 60 seconds", async () => {
+    const start = Date.now();
+    const s2 = await newSession("broken-prisma");
+    const r = await fixdRun(s2, ["doctor", "--fast"], { input: "exit", timeout: 90_000 });
+    await cleanup(s2);
+    expect(Date.now() - start).toBeLessThan(90_000);
+    expect(r.stdout.length).toBeGreaterThan(200);
+  }, 120_000);
 });

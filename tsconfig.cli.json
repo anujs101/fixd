@@ -14,7 +14,8 @@
   "include": [
     "cli/**/*",
     "src/**/*",
-    "automation/**/*"
+    "automation/**/*",
+    "checkers/**/*"
   ],
   "exclude": [
     "node_modules",

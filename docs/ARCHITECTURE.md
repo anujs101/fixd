@@ -6,7 +6,16 @@ code, or build tooling on top of FIXD's automation SDK.
 
 For the design philosophy and tradeoffs, see [DESIGN.md](DESIGN.md).
 
-## High-Level Architecture
+## High-Level Architecture (v0.4.0 — Plugin Checker System)
+
+> **Note:** This section describes the target architecture.
+> The current implementation (v0.3.0) has the LLM acting as both scanner and
+> fixer. See [ADR-0003](../.claude/adr/ADR-0003-plugin-checker-architecture.md)
+> for the migration plan.
+
+Doctor is an orchestrator, not a framework expert. It delegates all
+technology-specific knowledge to checker plugins and a centralized
+Discovery Engine.
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -308,6 +317,87 @@ failure:
 - Each success: confidence = min(1.0, confidence + 0.15)
 - Each failure: confidence = max(0.1, confidence - 0.2)
 - Patterns below 0.2 confidence are pruned after 10 failures
+
+## Checker Plugin System
+
+### Architecture
+
+```
+checkers/
+├── typescript/plugin.ts    # tsc --noEmit
+├── eslint/plugin.ts        # eslint
+├── prisma/plugin.ts        # prisma validate + generate
+├── react-vite/plugin.ts    # vite build
+├── env/plugin.ts           # environment variable validation
+├── dependencies/plugin.ts  # lockfile + missing deps
+├── rust/plugin.ts          # cargo check
+├── go/plugin.ts            # go vet
+├── python-mypy/plugin.ts   # mypy
+├── python-flake8/plugin.ts # flake8
+├── ruby/plugin.ts          # rubocop
+├── php/plugin.ts           # php -l
+├── java-maven/plugin.ts    # mvn compile
+├── kotlin-gradle/plugin.ts # gradle check
+├── docker/plugin.ts        # Dockerfile validation
+├── git/plugin.ts           # git status
+└── package-json/plugin.ts  # package.json structure
+```
+
+### Plugin Contract
+
+Each plugin implements `CheckerPlugin`:
+
+```typescript
+interface CheckerPlugin {
+  id: string;               // "typescript"
+  name: string;             // "TypeScript Compiler"
+  category: CheckerCategory; // "compile" | "lint" | "schema" | "build" | ...
+  requires: string[];       // signals: ["TypeScript"] or ["TypeScript","React","Vite"]
+  check(projectPath: string): Promise<CheckerResult>;
+  canAutoFix: boolean;
+  fix?(issues: AggregatedIssue[], projectPath: string): Promise<FixOperation[]>;
+  priority: number;
+  description: string;
+}
+```
+
+Plugins declare what they require. The Discovery Engine determines what
+exists. Doctor loads plugins matching the discovered stack.
+
+## Centralized Stack Discovery
+
+The Discovery Engine (`cli/lib/discovery.ts`) runs once per project and
+detects technologies using multiple signal types:
+
+- Config files (tsconfig.json, vite.config.ts, Cargo.toml)
+- Dependencies (react in package.json, prisma in deps)
+- Directory structure (src/, prisma/, frontend/)
+- Framework files (.jsx/.tsx extensions, App.tsx patterns)
+- Lockfiles (bun.lock, package-lock.json)
+- Runtime files (Dockerfile, docker-compose.yml)
+- Schema files (prisma/schema.prisma)
+
+Each signal contributes to a confidence score (0-1) per technology. The
+discovered stack is cached in `.fixd/memory.json` and trusted until files
+change (mtime-based invalidation). Checkers never implement their own
+discovery — they declare `requires` and the Discovery Engine determines
+eligibility.
+
+## Issue Dependency Graph
+
+After all checkers run, an Issue Graph Builder (`cli/lib/issue-graph.ts`)
+constructs a DAG using multiple evidence sources:
+
+- **Checker dependencies** (`requires`): Plugin A requires Signal X; Plugin B validates X → B's failures are root causes for A
+- **File overlap**: Two checkers reporting errors in the same file
+- **Import graph**: "Cannot find module X" → errors in files importing X
+- **Package/dependency graph**: Missing dep → compile errors in dependent packages
+- **Build pipeline ordering**: Schema errors → compile errors → build errors
+- **Category ordering**: `env` → `deps` → `schema` → `compile` → `lint` → `build`
+
+The graph identifies root causes (nodes with no incoming edges). Only root
+causes are sent to the LLM. Downstream effects are included for context but
+the LLM reasons about causes, not 18 disconnected symptoms.
 
 ## LLM Routing
 

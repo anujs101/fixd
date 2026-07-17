@@ -27,6 +27,23 @@ The philosophical difference:
 
 ## Core Principles
 
+### 7. Deterministic Scanners Are the Source of Truth
+
+Compile errors, schema validation failures, missing environment variables,
+and build failures are discovered by deterministic tools — not by LLMs.
+The LLM's role is to reason about verified facts: explain root causes,
+coordinate multi-file fixes, and identify architectural improvements that
+no linter can detect. The LLM should never rediscover what a compiler
+already knows.
+
+### 8. Extensible Through Plugins, Not Patches
+
+Adding support for a new framework or technology should mean adding a
+checker plugin to `checkers/<name>/plugin.ts`. Doctor's orchestration
+logic should never be modified for framework support. This separation
+ensures FIXD scales horizontally — each new checker is an independent
+module with a strict contract.
+
 ### 1. Deterministic Where Possible
 
 Project scanning, issue detection, and stack diagnostics run locally

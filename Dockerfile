@@ -10,9 +10,6 @@ RUN apt-get update && apt-get install -y \
   git \
   && rm -rf /var/lib/apt/lists/*
 
-# Disable telemetry
-ENV ELIZAOS_TELEMETRY_DISABLED=true
-ENV DO_NOT_TRACK=1
 
 WORKDIR /app
 
