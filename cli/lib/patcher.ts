@@ -340,11 +340,19 @@ async function applyStringPatch(
         // Fix 1: Pre-apply Prisma validation for edits
         if (op.path.endsWith(".prisma") || op.path.includes("prisma/schema.prisma")) {
           const prismaErr = await validatePrismaSchema(updated, projectRoot);
-          if (prismaErr) return { op: "edit", path: op.path, applied: false, diff: "",
-            error: `Prisma schema invalid after edit — rejected: ${prismaErr}` };
+          if (prismaErr) {
+            // Extract env var name from prisma error so agent knows what to fix
+            const envMatch = prismaErr.match(/Environment variable not found:\s*(\w+)/i);
+            const hint = envMatch
+              ? ` — set ${envMatch[1]} in .env first, then re-propose this edit`
+              : "";
+            return { op: "edit", path: op.path, applied: false, diff: "",
+              error: `Prisma schema invalid: ${prismaErr.slice(0, 200)}${hint}` };
+          }
         }
         await backupFile(abs, projectRoot);
         await atomicWrite(abs, updated);
+        markNormalizedApplied(op);
         const diff = contextDiff(content, op.search, op.replace);
         return { op: "edit", path: op.path, applied: true, diff };
     }
@@ -358,11 +366,19 @@ async function applyStringPatch(
         const updated = normOrig.slice(0, normIdx) + normReplace + normOrig.slice(normIdx + normSearch.length);
         await backupFile(abs, projectRoot);
         await atomicWrite(abs, updated);
+        markNormalizedApplied(op);
         const diff = contextDiff(content, op.search, op.replace);
         return { op: "edit", path: op.path, applied: true, diff };
     }
 
-    return { op: "edit", path: op.path, applied: false, diff: "", error: "search string not found in file" };
+    // ── Search failed — help the agent by showing what the file looks like ──
+    const firstLine = op.search.split("\n")[0].trim().slice(0, 60);
+    const filePreview = content.slice(0, 300).replace(/\n/g, "\\n");
+    return {
+      op: "edit", path: op.path, applied: false, diff: "",
+      error: `search string not found in ${op.path}. File starts with: ${filePreview}... ` +
+             `(searched for line starting with: "${firstLine}")`,
+    };
 }
 
 
@@ -413,13 +429,26 @@ export function clearNormalizedPatchHistory(): void {
   _normalizedPatchHashes.clear();
 }
 
-function isNormalizedDuplicate(op: PatchOperation): boolean {
+function normalizedHash(op: PatchOperation): string {
   let content = "";
   if (op.op === "create" || op.op === "append" || op.op === "prepend") content = op.content;
   else if (op.op === "edit") content = `${op.search} → ${op.replace}`;
-  const hash = `${op.path}::${normalizeContent(content)}`;
-  if (_normalizedPatchHashes.has(hash)) return true;
-  _normalizedPatchHashes.add(hash);
+  return `${op.path}::${normalizeContent(content)}`;
+}
+
+/** Check only — doesn't add to the set. Use before applying. */
+function checkNormalizedDuplicate(op: PatchOperation): boolean {
+  return _normalizedPatchHashes.has(normalizedHash(op));
+}
+
+/** Mark as applied after successful write. Only called when patch actually touched disk. */
+function markNormalizedApplied(op: PatchOperation): void {
+  _normalizedPatchHashes.add(normalizedHash(op));
+}
+
+function isNormalizedDuplicate(op: PatchOperation): boolean {
+  if (checkNormalizedDuplicate(op)) return true;
+  markNormalizedApplied(op);
   return false;
 }
 
@@ -438,31 +467,35 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
                 // Fix 1: Pre-apply Prisma validation
                 if (op.path.endsWith(".prisma") || op.path.includes("prisma/schema.prisma")) {
                   const prismaErr = await validatePrismaSchema(op.content, projectRoot);
-                  if (prismaErr) return { op: "create", path: op.path, applied: false, diff: "",
-                    error: `Prisma schema invalid — rejected: ${prismaErr}` };
+                  if (prismaErr) {
+                    const envMatch = prismaErr.match(/Environment variable not found:\s*(\w+)/i);
+                    const hint = envMatch ? ` — add ${envMatch[1]} to .env first, then retry` : "";
+                    return { op: "create", path: op.path, applied: false, diff: "",
+                      error: `Prisma schema invalid: ${prismaErr.slice(0, 200)}${hint}` };
+                  }
                 }
-                // Fix 2: Normalized duplicate detection
-                if (isNormalizedDuplicate(op)) return { op: "create", path: op.path, applied: false, diff: "",
+                // Fix 2: Normalized duplicate detection (check only — don't mark yet)
+                if (checkNormalizedDuplicate(op)) return { op: "create", path: op.path, applied: false, diff: "",
                   error: "Skipped: semantically identical patch already attempted" };
                 const exists = await fs.stat(abs).then(() => true).catch(() => false);
                 if (exists) {
-                    // Auto-promote WRITE on existing file to a full-file EDIT
-                    // instead of silently failing — this handles agent retries
                     await backupFile(abs, projectRoot);
                     await fs.mkdir(path.dirname(abs), { recursive: true });
                     await atomicWrite(abs, op.content);
+                    markNormalizedApplied(op);
                     const diff = prefixLines(op.content.split("\n"), "+ ");
                     return { op: "create", path: op.path, applied: true, diff };
                 }
                 await fs.mkdir(path.dirname(abs), { recursive: true });
                 await atomicWrite(abs, op.content);
+                markNormalizedApplied(op);
                 const diff = prefixLines(op.content.split("\n"), "+ ");
                 return { op: "create", path: op.path, applied: true, diff };
             }
 
             case "edit": {
-                // Fix 2: Normalized duplicate detection
-                if (isNormalizedDuplicate(op)) return { op: "edit", path: op.path, applied: false, diff: "",
+                // Fix 2: Normalized duplicate detection (check only — don't mark yet)
+                if (checkNormalizedDuplicate(op)) return { op: "edit", path: op.path, applied: false, diff: "",
                   error: "Skipped: semantically identical patch already attempted" };
                 if (op.path.endsWith(".json")) {
                     return applyJsonPatch(op, projectRoot, abs);

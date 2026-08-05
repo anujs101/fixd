@@ -224,9 +224,15 @@ async function agenticTurn(
         // Step 3: Feed dedup rejections back to the agent so it can try a
         // different approach. The patcher's isNormalizedDuplicate now handles
         // all dedup — SessionState.triedFixes has been removed.
-        if (applied.length === 0 && rejected.some(p => p.error?.includes("Skipped") || p.error?.includes("identical"))) {
-            const errors = [...new Set(rejected.map(p => p.error).filter(Boolean))].join("; ");
-            await agenticTurn(`[Patch rejected: ${errors}]. Form a different hypothesis.`, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues, currentMemory);
+        if (applied.length === 0 && rejected.length > 0) {
+            const rejectionReasons = [...new Set(rejected.map(p => p.error).filter(Boolean))].join("; ");
+            // Pass the exact rejection reason to the agent — especially prisma validation
+            // errors that tell the agent what env var to set before retrying the edit.
+            const isDedup = rejectionReasons.includes("Skipped") || rejectionReasons.includes("identical");
+            const instruction = isDedup
+              ? "Form a different hypothesis."
+              : "Fix the reported problem and re-propose the same edit.";
+            await agenticTurn(`[Patch rejected: ${rejectionReasons}]. ${instruction}`, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, detectedIssues, currentMemory);
             return;
         }
 

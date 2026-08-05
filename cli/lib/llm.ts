@@ -151,7 +151,7 @@ async function fetchWithRetry(
 
 /** Strip <think>...</think> blocks emitted by extended-thinking models */
 function stripThink(text: string): string {
-    return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    return text.replace(/<think>[\s\S]*?<\/think>/g, "");
 }
 
 /**
@@ -182,7 +182,7 @@ export async function ask(
     if (choice?.finish_reason === "length") {
         warn("⚠ agent response was truncated (token limit hit) — output may be incomplete");
     }
-    return stripThink(choice?.message?.content ?? "");
+    return stripThink(choice?.message?.content ?? "").trim();
 }
 
 /**
@@ -272,5 +272,5 @@ export async function chat(messages: Message[], task: Task): Promise<string> {
     if (choice?.finish_reason === "length") {
         warn("⚠ agent response was truncated (token limit hit) — output may be incomplete");
     }
-    return stripThink(choice?.message?.content ?? "");
+    return stripThink(choice?.message?.content ?? "").trim();
 }
