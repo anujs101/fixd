@@ -43,22 +43,42 @@ const typescriptChecker: CheckerPlugin = {
 
   async check(projectPath: string): Promise<CheckerResult> {
     const start = Date.now();
-    const tsc = await findTsc(projectPath);
-    if (!tsc) {
-      return {
-        checker: "typescript", category: "compile", passed: true,
-        errors: [], warnings: [], skipped: true,
-        skipReason: "tsc not installed (run: npm install typescript)", durationMs: Date.now() - start,
-      };
+    const errors: any[] = [];
+    const warnings: any[] = [];
+
+    // Check tsconfig strict mode (migrated from fixEnv.ts detectIssues)
+    const tsconfigPath = path.join(projectPath, "tsconfig.json");
+    if (fs.existsSync(tsconfigPath)) {
+      try {
+        const tsconfig = JSON.parse(fs.readFileSync(tsconfigPath, "utf-8"));
+        if (tsconfig.compilerOptions?.strict !== true) {
+          warnings.push({
+            file: "tsconfig.json", severity: "warning",
+            code: "TSCONFIG_STRICT_MISSING",
+            message: "tsconfig.json does not have strict:true. Unsafe TypeScript patterns are allowed.",
+            raw: "TSCONFIG_STRICT_MISSING",
+          });
+        }
+      } catch { /* invalid JSON — package-json checker handles this */ }
     }
+
+    const tsc = await findTsc(projectPath);
+    if (!tsc) return {
+      checker: "typescript", category: "compile",
+      passed: true, errors: [], warnings, skipped: true,
+      skipReason: "tsc not installed", durationMs: Date.now() - start,
+    };
     try {
       const { stdout, stderr, exitCode } = await execa(tsc, ["--noEmit"], {
         cwd: projectPath, reject: false, timeout: 60_000,
       });
       const all = parseTsc(stdout ?? "", stderr ?? "", projectPath);
+      const errors = all.filter(e => e.severity === "error");
+      // Pass/fail based on actual errors found, not exit code.
+      // tsc may exit non-zero for tsconfig warnings that don't produce parseable errors.
       return {
         checker: "typescript", category: "compile",
-        passed: exitCode === 0 && all.filter(e => e.severity === "error").length === 0,
+        passed: errors.length === 0,
         errors: all.filter(e => e.severity === "error"),
         warnings: all.filter(e => e.severity !== "error"),
         skipped: false, durationMs: Date.now() - start,

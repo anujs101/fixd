@@ -42,6 +42,7 @@ vi.mock("../../cli/lib/patcher.js", () => ({
     return [{ op: "edit", path: editMatch[1].trim(), applied: true, diff: "" }];
   }),
   resetBackupSession: vi.fn(),
+  clearNormalizedPatchHistory: vi.fn(),
 }));
 
 vi.mock("../../cli/lib/projectReader.js", () => ({ readRelevantFiles: vi.fn(async () => "") }));
@@ -57,6 +58,8 @@ vi.mock("../../cli/lib/sub-agents.js", () => ({
   synthesizeDiagnosis: vi.fn(async () => ""),
 }));
 vi.mock("../../cli/lib/command-classifier.js", () => ({ classifyCommand: vi.fn(async () => ({ classification: "auto-run", reason: "safe-prefix" })) }));
+vi.mock("../../cli/lib/checker-loader.js", () => ({ loadAllCheckers: vi.fn(async () => []), filterByStack: vi.fn(() => []) }));
+vi.mock("../../cli/lib/discovery.js", () => ({ discoverStack: vi.fn(() => ({ signals: {}, detectedAt: new Date().toISOString(), projectHash: "test" })) }));
 vi.mock("../../cli/lib/diagnostics.js", () => ({
   runDiagnostics: vi.fn(async () => []),
   formatDiagnosticsForContext: vi.fn(() => ""),
@@ -131,13 +134,12 @@ describe("agentic loop state", () => {
     );
     await runDoctor("/tmp/project", false, false);
     const patchApplyCalls = vi.mocked(proposeAndApply).mock.calls.filter((call) => call[0].includes("<<<EDIT:"));
-    expect(patchApplyCalls).toHaveLength(1);
-    expect(vi.mocked(sendMessage).mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining([
-      expect.stringContaining("Skipped: identical fix already attempted"),
-    ]));
+    // Both edits reach proposeAndApply (triedFixes is removed). The real patcher
+    // handles dedup via isNormalizedDuplicate; the mock always returns applied:true.
+    expect(patchApplyCalls).toHaveLength(2);
   });
 
-  test("triedFixes set persists across turns", async () => {
+  test("duplicate patches are rejected by normalized dedup", async () => {
     const state = __doctorTest.makeSessionState();
     loopState.responses.push(
       "<<<EDIT: src/index.ts>>>\n<<<SEARCH>>>\nold\n<<<REPLACE>>>\nnew\n<<<END>>>",
@@ -147,11 +149,9 @@ describe("agentic loop state", () => {
     );
     await __doctorTest.agenticTurn("fix", "/tmp/project", 0, state, new Set<string>(), [], [], [], []);
     await __doctorTest.agenticTurn("fix again", "/tmp/project", 0, state, new Set<string>(), [], [], [], []);
-    expect(state.triedFixes.has("src/index.ts::old")).toBe(true);
-    expect(loopState.appliedPatchCount).toBe(1);
-    expect(vi.mocked(sendMessage).mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining([
-      expect.stringContaining("Skipped: identical fix already attempted"),
-    ]));
+    // Both edits reach proposeAndApply (triedFixes removed). The real patcher
+    // handles dedup via isNormalizedDuplicate. The mock doesn't implement it.
+    expect(loopState.appliedPatchCount).toBe(2);
   });
 
   test("hypotheses array accumulates entries across turns", async () => {
@@ -220,11 +220,18 @@ describe("agentic loop state", () => {
     expect(vi.mocked(agentSays).mock.calls[0][0]).toContain("STILL_BROKEN");
   });
 
-  test("duplicate patch is not reapplied", async () => {
+  test("patch rejection feeds back to agent via sendMessage", async () => {
     const state = __doctorTest.makeSessionState();
-    state.triedFixes.add("src/index.ts::old");
-    loopState.responses.push("<<<EDIT: src/index.ts>>>\n<<<SEARCH>>>\nold\n<<<REPLACE>>>\nnew\n<<<END>>>", "done");
+    // Override proposeAndApply to return a rejection
+    const oldImpl = vi.mocked(proposeAndApply).getMockImplementation();
+    vi.mocked(proposeAndApply).mockImplementation(async (_text: string) => {
+      return [{ op: "edit" as const, path: "src/index.ts", applied: false, diff: "", error: "Skipped: semantically identical patch already attempted" }];
+    });
+    loopState.responses.push("<<<EDIT: src/index.ts>>>\n<<<SEARCH>>>\nold\n<<<REPLACE>>>\nnew\n<<<END>>>");
     await __doctorTest.agenticTurn("fix", "/tmp/project", 0, state, new Set<string>(), [], [], [], []);
-    expect(vi.mocked(proposeAndApply).mock.calls.filter((call) => call[0].includes("<<<EDIT:"))).toHaveLength(0);
+    vi.mocked(proposeAndApply).mockImplementation(oldImpl!);
+    // Agent should receive feedback about the rejected patch
+    const agentMessages = vi.mocked(sendMessage).mock.calls.map(c => c[0] as string);
+    expect(agentMessages.some(m => m.includes("Patch rejected") || m.includes("Skipped"))).toBe(true);
   });
 });

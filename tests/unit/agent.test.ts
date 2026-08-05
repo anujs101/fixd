@@ -57,7 +57,7 @@ describe("agent session", () => {
     await sendMessage("x".repeat(250_000));
     const messages = chatMock.mock.calls[0][0];
     expect(messages[0].role).toBe("system");
-    expect(messages[0].content).toContain("WHEN IMPLEMENTING CODE CHANGES");
+    expect(messages[0].content).toContain("PATCH FORMAT");
   });
 
   test("FIXD.md is prepended to system prompt", async () => {

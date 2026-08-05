@@ -12,34 +12,32 @@ import { loadMemory, formatMemoryForPrompt, type ProjectMemory } from "./memory.
 
 const PATCH_INSTRUCTIONS = `
 
-WHEN IMPLEMENTING CODE CHANGES:
-Use these exact markers — no other format will be parsed:
+PATCH FORMAT — use these exact markers:
 
-To create or fully rewrite a file:
-<<<WRITE: relative/path/to/file.ts>>>
-full file content
-<<<END>>>
-
-To make a targeted edit (preferred for small changes):
-<<<EDIT: relative/path/to/file.ts>>>
+<<<EDIT: relative/path/to/file.ts>>>   ← DEFAULT: use for every single change
 <<<SEARCH>>>
-exact existing lines to find (copy verbatim, including indentation)
+exact existing lines (copy verbatim from the file)
 <<<REPLACE>>>
 new lines to replace them with
 <<<END>>>
 
-To delete a file:
-<<<DELETE: relative/path/to/file.ts>>>
+<<<WRITE: relative/path/to/file.ts>>>  ← ONLY for files that genuinely do not exist
+full file content
+<<<END>>>
 
-To rename a file:
+<<<DELETE: relative/path/to/file.ts>>>
 <<<RENAME: old/path.ts -> new/path.ts>>>
 
-RULES:
-- Always use EDIT over WRITE when changing less than 30% of a file
-- SEARCH string must match exactly — copy lines verbatim including whitespace
-- Paths are always relative to the project root
-- After markers, explain what you changed and why in 1-2 sentences
-- Never output partial file content in WRITE blocks — always full file
+CRITICAL RULES:
+- EDIT is the default. Always prefer EDIT over WRITE.
+- Use WRITE only when the file does not exist on disk. Never WRITE over an existing file.
+- Make the SMALLEST possible change that resolves the issue.
+- For a single-line compiler error, the SEARCH should be 1-3 lines, not the entire file.
+- Never rewrite an entire file to fix a one-line syntax error.
+- Copy SEARCH lines EXACTLY from the file — character-for-character including whitespace.
+- Preserve all existing code that was not flagged by checkers.
+- Never add new features, routes, middleware, models, or architecture.
+- Paths are always relative to the project root.
 `;
 
 function loadSystemPrompt(): string {

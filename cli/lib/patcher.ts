@@ -7,9 +7,12 @@
 //           every write, enabling `fixd undo` to restore them.
 
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import chalk from "chalk";
 import { printFix, confirm, success, warn } from "./display.js";
+import { execa } from "execa";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -334,6 +337,12 @@ async function applyStringPatch(
     const idx = content.indexOf(op.search);
     if (idx !== -1) {
         const updated = content.slice(0, idx) + op.replace + content.slice(idx + op.search.length);
+        // Fix 1: Pre-apply Prisma validation for edits
+        if (op.path.endsWith(".prisma") || op.path.includes("prisma/schema.prisma")) {
+          const prismaErr = await validatePrismaSchema(updated, projectRoot);
+          if (prismaErr) return { op: "edit", path: op.path, applied: false, diff: "",
+            error: `Prisma schema invalid after edit — rejected: ${prismaErr}` };
+        }
         await backupFile(abs, projectRoot);
         await atomicWrite(abs, updated);
         const diff = contextDiff(content, op.search, op.replace);
@@ -357,6 +366,63 @@ async function applyStringPatch(
 }
 
 
+// ─── Pre-apply Prisma validation (Fix 1) ─────────────────────────────────────
+
+async function validatePrismaSchema(proposedContent: string, projectRoot: string): Promise<string | null> {
+  const tmpDir = fsSync.mkdtempSync(path.join(os.tmpdir(), "fixd-prisma-"));
+  const tmpSchema = path.join(tmpDir, "schema.prisma");
+  try {
+    await fs.writeFile(tmpSchema, proposedContent, "utf-8");
+    let env: Record<string, string> | undefined;
+    const envPath = path.join(projectRoot, ".env");
+    if (fsSync.existsSync(envPath)) {
+      const envRaw = await fs.readFile(envPath, "utf-8");
+      env = {};
+      for (const line of envRaw.split("\n")) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const eq = t.indexOf("=");
+        if (eq > 0) env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+      }
+    }
+    const prismaBin = fsSync.existsSync(path.join(projectRoot, "node_modules", ".bin", "prisma"))
+      ? path.join(projectRoot, "node_modules", ".bin", "prisma") : "npx prisma";
+    const { stderr, exitCode } = await execa(prismaBin, ["validate"], {
+      cwd: tmpDir,
+      env: { ...process.env, ...env, DATABASE_URL: env?.DATABASE_URL ?? "file:./dev.db" },
+      reject: false, timeout: 15_000,
+    });
+    if (exitCode !== 0 && stderr) return stderr.slice(0, 500).trim();
+    return null;
+  } catch (err: any) {
+    return `Prisma validation unavailable: ${err.message}`;
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// ─── Normalized dedup (Fix 2) ─────────────────────────────────────────────────
+
+function normalizeContent(content: string): string {
+  return content.replace(/\s+/g, " ").replace(/\s*([{}():=,])\s*/g, "$1").toLowerCase().trim();
+}
+
+const _normalizedPatchHashes = new Set<string>();
+
+export function clearNormalizedPatchHistory(): void {
+  _normalizedPatchHashes.clear();
+}
+
+function isNormalizedDuplicate(op: PatchOperation): boolean {
+  let content = "";
+  if (op.op === "create" || op.op === "append" || op.op === "prepend") content = op.content;
+  else if (op.op === "edit") content = `${op.search} → ${op.replace}`;
+  const hash = `${op.path}::${normalizeContent(content)}`;
+  if (_normalizedPatchHashes.has(hash)) return true;
+  _normalizedPatchHashes.add(hash);
+  return false;
+}
+
 export async function applyPatch(op: PatchOperation, projectRoot: string): Promise<PatchResult> {
     const abs = path.resolve(projectRoot, op.path);
 
@@ -369,6 +435,15 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
     try {
         switch (op.op) {
             case "create": {
+                // Fix 1: Pre-apply Prisma validation
+                if (op.path.endsWith(".prisma") || op.path.includes("prisma/schema.prisma")) {
+                  const prismaErr = await validatePrismaSchema(op.content, projectRoot);
+                  if (prismaErr) return { op: "create", path: op.path, applied: false, diff: "",
+                    error: `Prisma schema invalid — rejected: ${prismaErr}` };
+                }
+                // Fix 2: Normalized duplicate detection
+                if (isNormalizedDuplicate(op)) return { op: "create", path: op.path, applied: false, diff: "",
+                  error: "Skipped: semantically identical patch already attempted" };
                 const exists = await fs.stat(abs).then(() => true).catch(() => false);
                 if (exists) {
                     // Auto-promote WRITE on existing file to a full-file EDIT
@@ -386,6 +461,9 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
             }
 
             case "edit": {
+                // Fix 2: Normalized duplicate detection
+                if (isNormalizedDuplicate(op)) return { op: "edit", path: op.path, applied: false, diff: "",
+                  error: "Skipped: semantically identical patch already attempted" };
                 if (op.path.endsWith(".json")) {
                     return applyJsonPatch(op, projectRoot, abs);
                 }

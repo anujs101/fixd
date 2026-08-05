@@ -15,7 +15,7 @@ vi.mock("../../cli/lib/display.js", () => ({
   bye: vi.fn(),
 }));
 
-import { applyPatch, parsePatchOperations, proposeAndApply, resetBackupSession } from "../../cli/lib/patcher.js";
+import { applyPatch, parsePatchOperations, proposeAndApply, resetBackupSession, clearNormalizedPatchHistory } from "../../cli/lib/patcher.js";
 import { runUndo } from "../../cli/undo.js";
 
 describe("parsePatchOperations", () => {
@@ -77,6 +77,7 @@ describe("proposeAndApply and applyPatch", () => {
   beforeEach(() => {
     tmpDir = makeTmpDir();
     resetBackupSession();
+    clearNormalizedPatchHistory();
   });
 
   afterEach(() => cleanupDir(tmpDir));

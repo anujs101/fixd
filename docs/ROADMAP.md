@@ -1,108 +1,50 @@
-# FIXD — Roadmap
+# FIXD — Roadmap (v0.3.0)
 
-> Last updated: 2026-07-15 | Based on v0.3.0
+## Completed
 
-## Recently Completed
+- ✅ Endpoint abstraction (ADR-0002): OpenAI/Anthropic/Gemini/Ollama adapters
+- ✅ Plugin checker system (ADR-0003): 7 checker plugins, Discovery Engine, Issue Graph
+- ✅ Repository-driven repair loop: fresh prompt per iteration, duplicate detection, loop detection
+- ✅ Minimal sufficient change: per-category repair strategies, EDIT default, anti-rewrite rules
+- ✅ Automation SDK: programmatic build/session/run/fixture API with `fixd-dev` CLI
+- ✅ Acceptance suite: 22 end-to-end tests across 6 workflows
+- ✅ Compiled binary: standalone 57MB executable via Bun compile
+- ✅ Batch memory persistence: in-memory accumulation, saves reduced 10→2
+- ✅ Task-aware temperature/max_tokens: per-task LLM parameters
+- ✅ Retry/fallback: network error retry, 500/504 retry, sendMessage retry
 
-- ✅ **P0-1**: Follow-up chat turns always route to large model
-- ✅ **P0-2**: Network error retry, 500/504 retry, sendMessage retry
-- ✅ **P0-3**: Task-aware temperature and max_tokens routing
-- ✅ **P1-4**: Promise.allSettled for independent file reads
-- ✅ **P1-5**: Batch memory persistence (in-memory accumulation, saves reduced 10→2)
-- ✅ **P1-6**: Sub-agent parallelization — investigated and rejected (data dependencies)
-- ✅ **Automation SDK**: Internal programmatic API for driving FIXD (build, session, run, fixture, CLI)
-- ✅ **ADR-0001**: Internal automation layer design documented
-- ✅ **Endpoint Abstraction**: Provider-centric → endpoint-centric architecture. Any OpenAI-compatible, Anthropic, Gemini, or Ollama endpoint works. Config via `~/.config/fixd/config.json`. Auto-migration from legacy env vars. ADR-0002.
-- ✅ **ADR-0002**: Endpoint abstraction layer design documented
-- ✅ **ADR-0003**: Plugin checker architecture designed (Discovery Engine, Issue Dependency Graph, Doctor as orchestrator)
+## Immediate
 
-## Immediate (Next 1-2 sprints)
+- **Checker plugins for React/Vite/Next.js** — Frontend issues currently undetected
+- **`--verbose` flag** — Raw LLM responses, full prompts, API timing
+- **`--max-depth N` flag** — Override repaired depth limit of 6
+- **Remove deprecated diagnostics.ts** — Migrate remaining STACK_CHECKERS to plugins
+- **Remove fixEnv.ts detection overlap** — env checker is canonical, keep fixers only
+- **Stream checker output** — Display results as each checker completes instead of all at once
+- **Checker hot-reload in dev mode** — Watch `checkers/` directory for new plugins
 
-### Plugin Checker System (ADR-0003)
-- **Discovery Engine** — Centralized stack detection from config files, deps, dirs, framework files
-- **Checker plugins** — Migrate existing `STACK_CHECKERS` to `checkers/*/plugin.ts`
-- **New checkers** — env, prisma, react-vite, dependencies, git, docker, package-json
-- **Issue Dependency Graph** — Build DAG from checker deps, file overlap, import graph, category ordering
-- **Doctor as orchestrator** — Remove framework-specific code from doctor.ts
-- **Verification loop** — Re-run affected checkers after fixes, zero user prompting
-- **exploreProject() repurposed** — Architecture reasoning, not error discovery
+## Medium-Term
 
-## Immediate (Next 1-2 sprints)
-
-### Reliability
-- **Graceful degradation when endpoint is down** — Inform user which
-  endpoint is serving each request and surface errors clearly
-- **Validate patch SEARCH strings before proposing** — Whitespace-normalized
-  retry helps, but silent failures still produce confusing NO CHANGE outcomes
-
-### Developer Experience
-- **`--verbose` flag** — Show raw LLM responses, full prompts, API timing
-- **`--max-depth N` flag** — Override hardcoded depth limit of 6
-- **Progress persistence for interrupted sessions** — Save session memory
-  on Ctrl+C before exit
-
-## Medium-Term (1-3 months)
-
-### New Commands
 - **`fixd test`** — Generate and run tests for a project
-- **`fixd explain`** — Explain a specific error or code pattern without
-  entering full doctor mode
-- **`fixd review`** — Pre-commit code review using diagnostic engine + LLM
+- **`fixd explain`** — Explain a specific error without full doctor mode
+- **`fixd review`** — Pre-commit code review using checkers + LLM
+- **Plugin distribution** — npm-published checker plugins installable via `fixd plugin add`
+- **Monorepo support** — Multi-project workspaces
+- **SARIF/Code Climate output** — CI integration via `fixd ci`
 
-### Architecture
-- **Additional checker plugins** — Community-contributed checkers for
-  Remix, SvelteKit, tRPC, Django, Rails, Flutter, etc.
-- **Plugin distribution** — npm-published checker plugins installable
-  via `fixd plugin add <name>`
+## Long-Term
 
-### Performance
-- **Stream sub-agent responses** — Real-time diagnosis display instead of
-  spinner-then-dump
-- **Increase test coverage** — Core functions need better integration coverage
-
-## Long-Term (3-6 months)
-
-### Vision
-- **`fixd watch`** — File watcher that re-runs diagnostics on save
-- **`fixd ci`** — Machine-readable output (SARIF/Code Climate) for CI
-- **Multi-project workspaces** — Monorepo support
-- **`fixd learn`** — Interactive tutorial mode that teaches about issues
-  rather than just fixing them
-- **Remote agent mode** — Optional cloud service for teams with centralized
-  API key management
-
-### Architecture
-- **Extract `cli/lib/` into `@fixd/core`** — Enable IDE integrations,
-  CI/CD tooling, third-party consumption
-- **Formal schemas for sub-agent communication** — Type generation,
-  validation, documentation
-
-### Quality
-- **Optional telemetry** — Anonymized usage data for understanding real-world
-  usage patterns
-- **Windows support** — Currently Unix-centric (lsof, kill, path separators)
-- **Formal verification of safety properties** — Command classifier and path
-  traversal guard are security-critical
+- **`fixd watch`** — File watcher that re-runs checkers on save
+- **`fixd learn`** — Interactive tutorial mode
+- **Remote agent mode** — Centralized API key management for teams
+- **Windows support** — Currently Unix-centric
 
 ## Deliberately Deferred
 
 | Item | Reason |
 |---|---|
-| Web UI / dashboard | Violates terminal-first design philosophy |
-| Agent server / daemon mode | Adds deployment complexity without clear user benefit |
-| Multi-user / team features | Premature — tool is single-user by design |
-| Plugin marketplace | Premature — needs plugin system first |
-| Native binary (Bun compile) | npm global install works fine; binary adds build complexity |
+| Web UI / dashboard | Violates terminal-first philosophy |
+| Agent server / daemon | Adds complexity without clear benefit |
+| Multi-user / team features | Premature |
+| Native binary (Bun compile) | Already done — 57MB Mach-O arm64 |
 | LangChain / AI framework | Violates minimal-dependency philosophy |
-
-## Impact Ranking
-
-Ranked by (user impact × implementation feasibility):
-
-1. `--verbose` flag — Unlocks self-serve debugging
-2. Streaming sub-agent responses — Perceived performance, better UX
-3. Plugin issue detectors — Community leverage, ecosystem growth
-4. `fixd test` command — Natural feature expansion
-5. `fixd explain` — Addresses common "quick question" use case
-6. Cache project scans — Cuts doctor latency on re-scans
-7. Long-term vision items — Major features, need foundation first

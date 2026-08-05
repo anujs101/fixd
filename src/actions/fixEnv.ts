@@ -259,35 +259,8 @@ export interface DetectedIssue {
 export function detectIssues(scan: ProjectScan, projectPath: string): DetectedIssue[] {
   const issues: DetectedIssue[] = [];
 
-  // Prisma pooled without directUrl
-  if (scan.prisma.found && scan.prisma.connectionType === "pooled" && !scan.prisma.hasDirectUrl) {
-    issues.push({
-      severity: "HIGH",
-      type: "PRISMA_POOLED_WITHOUT_DIRECT_URL",
-      description:
-        "DATABASE_URL uses a pooled connection but no directUrl is set. " +
-        "Prisma migrations (prisma migrate dev) will fail.",
-      autoFixable: true,
-      fix: () => fixPrismaDirectUrl(projectPath, scan),
-    });
-  }
-
-  // Missing DATABASE_URL when prisma is present
-  if (scan.prisma.found && !scan.env.vars["DATABASE_URL"]) {
-    issues.push({
-      severity: "HIGH",
-      type: "MISSING_DATABASE_URL",
-      description: "Prisma schema found but DATABASE_URL is not set in .env.",
-      autoFixable: true,
-      fix: () =>
-        addMissingEnvKey(
-          projectPath,
-          "DATABASE_URL",
-          "postgresql://user:pass@host:5432/dbname?sslmode=require",
-          "Prisma database connection URL"
-        ),
-    });
-  }
+  // NOTE: PRISMA_POOLED_WITHOUT_DIRECT_URL → checkers/prisma/
+  // NOTE: MISSING_DATABASE_URL → checkers/env/
 
   // Port conflicts on common dev ports
   const devPorts = [3000, 5173, 8080, 4000];
@@ -303,39 +276,10 @@ export function detectIssues(scan: ProjectScan, projectPath: string): DetectedIs
     }
   }
 
-  // tsconfig missing strict
-  if (scan.tsconfig && scan.tsconfig.compilerOptions?.strict !== true) {
-    issues.push({
-      severity: "LOW",
-      type: "TSCONFIG_STRICT_MISSING",
-      description: 'tsconfig.json does not have "strict": true. This allows unsafe TypeScript patterns.',
-      autoFixable: true,
-      fix: () => fixTsconfigStrict(projectPath, scan),
-    });
-  }
+  // NOTE: TSCONFIG_STRICT_MISSING → checkers/typescript/
+  // NOTE: MISSING_PACKAGE_JSON   → checkers/package-json/
+  // NOTE: MISSING_SCRIPTS        → checkers/package-json/
 
-  // No package.json
-  if (!scan.packageJson) {
-    issues.push({
-      severity: "HIGH",
-      type: "MISSING_PACKAGE_JSON",
-      description: "No package.json found in this directory. Is this a Node.js project?",
-      autoFixable: false,
-    });
-  }
-
-  // Missing dev/start scripts
-  if (scan.packageJson) {
-    const scripts = scan.packageJson.scripts ?? {};
-    if (!scripts.dev && !scripts.start) {
-      issues.push({
-        severity: "MEDIUM",
-        type: "MISSING_SCRIPTS",
-        description: 'package.json has no "dev" or "start" script.',
-        autoFixable: false,
-      });
-    }
-  }
 
   // Node version mismatch
   if (scan.nodeVersion && scan.requiredNodeVersion) {

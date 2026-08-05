@@ -33,10 +33,13 @@ describe("fixd doctor — checker pipeline", () => {
     expect(stdout).toContain("root cause");
   });
 
-  test("detects issue via both old detector and new checker", () => {
-    // The old detectIssues() still finds MISSING_DATABASE_URL
-    // AND the new env checker also finds it
-    expect(stdout).toContain("MISSING_DATABASE_URL");
+  test("checker pipeline is the sole source of truth for DATABASE_URL", () => {
+    // After consolidation: old detectIssues() no longer reports this.
+    // The env checker is the canonical detector — it reports the issue
+    // as "Missing required environment variable: DATABASE_URL"
+    expect(stdout).toContain("DATABASE_URL");
+    // Old detector should report no issues for this fixture
+    expect(stdout).toMatch(/no issues/i);
   });
 
   test("package-json checker passes on valid fixture", () => {

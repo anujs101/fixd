@@ -149,6 +149,19 @@ export function buildIssueGraph(
 
 // ─── Format for LLM ─────────────────────────────────────────────────────────
 
+/** Per-category repair instructions — the LLM must follow these exactly. */
+const CATEGORY_RULES: Record<string, string> = {
+  compile: "COMPILER ERROR — fix ONLY the exact line(s) reported. Use <<<EDIT>>> with SEARCH/REPLACE. Do NOT rewrite the entire file. Do NOT add new code.",
+  lint: "LINT ISSUE — fix ONLY the reported rule violation. One targeted <<<EDIT>>> per issue.",
+  schema: "SCHEMA ISSUE — fix ONLY the reported schema problem. Do NOT add new models or relationships.",
+  env: "ENV ISSUE — add ONLY the missing variable. Use a single <<<EDIT>>> on .env.",
+  deps: "DEPENDENCY ISSUE — edit package.json to add/remove ONLY the reported dependency.",
+  build: "BUILD FAILURE — fix ONLY the build errors. Do NOT regenerate the entire project.",
+  structure: "MISSING FILE — create ONLY the reported missing file. Minimal viable content.",
+  container: "DOCKER ISSUE — fix ONLY the reported Dockerfile problem.",
+  vcs: "GIT ISSUE — report the issue; do NOT run git commands.",
+};
+
 /** Format the issue graph as a structured report for the LLM. */
 export function formatGraphForPrompt(graph: IssueGraph, stackLabel: string): string {
   const lines: string[] = [
@@ -162,39 +175,33 @@ export function formatGraphForPrompt(graph: IssueGraph, stackLabel: string): str
     return lines.join("\n");
   }
 
-  lines.push("## Root Causes");
-  for (let i = 0; i < graph.rootCauses.length; i++) {
-    const rc = graph.rootCauses[i];
-    const label = rc.file ? `${rc.file}${rc.line ? `:${rc.line}` : ""}` : "(no file)";
-    lines.push(`  ${i + 1}. [${rc.category}] ${rc.severity} — ${rc.message} (${label})`);
+  // Group root causes by category
+  const byCategory = new Map<string, typeof graph.rootCauses>();
+  for (const rc of graph.rootCauses) {
+    if (!byCategory.has(rc.category)) byCategory.set(rc.category, []);
+    byCategory.get(rc.category)!.push(rc);
   }
 
-  // Group downstream effects by root cause
-  const effects = new Map<string, IssueNode[]>();
-  for (const edge of graph.edges) {
-    if (!effects.has(edge.from)) effects.set(edge.from, []);
-    const target = graph.nodes.find(n => n.id === edge.to);
-    if (target) effects.get(edge.from)!.push(target);
-  }
-
-  if (effects.size > 0) {
-    lines.push("");
-    lines.push("## Downstream Effects");
-    for (const [causeId, effs] of effects) {
-      const cause = graph.nodes.find(n => n.id === causeId);
-      if (!cause || effs.length === 0) continue;
-      lines.push(`  ${cause.message.slice(0, 80)} → causes ${effs.length} downstream issue(s):`);
-      for (const e of effs.slice(0, 5)) {
-        lines.push(`    - [${e.category}] ${e.message.slice(0, 80)}`);
-      }
+  for (const [category, causes] of byCategory) {
+    const rule = CATEGORY_RULES[category] ?? "Fix the reported issue with the smallest possible change.";
+    lines.push(`## ${category.toUpperCase()} (${causes.length} issue(s))`);
+    lines.push(`  REPAIR STRATEGY: ${rule}`);
+    for (const rc of causes) {
+      const label = rc.file ? `${rc.file}${rc.line ? `:${rc.line}` : ""}` : "(no file)";
+      lines.push(`  - ${rc.message} ${label !== "(no file)" ? `(${label})` : ""}`);
     }
+    lines.push("");
   }
 
-  lines.push("");
-  lines.push("## Instructions");
-  lines.push("You are fixd. The issues above were detected by deterministic tools.");
-  lines.push("Your job: explain root causes, prioritize fixes, coordinate multi-file edits.");
-  lines.push("Do NOT propose running compilers/linters — they already ran. Output patches directly.");
+  lines.push("## CRITICAL RULES");
+  lines.push("1. Make the SMALLEST possible change that satisfies the checker.");
+  lines.push("2. Use <<<EDIT>>> with SEARCH/REPLACE for line-level fixes — never <<<WRITE>>> for existing files.");
+  lines.push("3. <<<WRITE>>> only for files that genuinely do not exist.");
+  lines.push("4. Never rewrite an entire file to fix a single-line error.");
+  lines.push("5. Never add new features, routes, middleware, models, or architecture.");
+  lines.push("6. Preserve all existing code that the checker did not flag.");
+  lines.push("7. For parser/syntax errors (TS1xxx): fix ONLY the reported token, not the surrounding code.");
+  lines.push("8. Output patches directly. No explanations. No prose.");
 
   return lines.join("\n");
 }

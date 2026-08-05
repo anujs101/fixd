@@ -29,6 +29,31 @@ const prismaChecker: CheckerPlugin = {
       };
     }
 
+    // Check for pooled connection without directUrl (migrated from fixEnv.ts)
+    const schema = fs.readFileSync(schemaPath, "utf-8");
+    if (schema.includes("url") && !schema.includes("directUrl")) {
+      const urlMatch = schema.match(/url\s*=\s*env\(["']([^"']+)["']\)/);
+      if (urlMatch) {
+        const envKey = urlMatch[1];
+        const envPath = path.join(projectPath, ".env");
+        let urlValue = "";
+        if (fs.existsSync(envPath)) {
+          const envRaw = fs.readFileSync(envPath, "utf-8");
+          const match = envRaw.match(new RegExp(`^${envKey}=(.+)$`, "m"));
+          if (match) urlValue = match[1].trim();
+        }
+        // Neon/Supabase pooled URLs have pooler subdomain or port 6543
+        if (urlValue.includes("pooler.") || urlValue.includes("-pooler.") || urlValue.includes(":6543")) {
+          warnings.push({
+            file: "prisma/schema.prisma", severity: "warning",
+            code: "PRISMA_POOLED_WITHOUT_DIRECT_URL",
+            message: "DATABASE_URL uses a pooled connection but no directUrl is set. Migrations will fail.",
+            raw: "PRISMA_POOLED_WITHOUT_DIRECT_URL",
+          });
+        }
+      }
+    }
+
     // Find prisma CLI
     const localPrisma = path.join(projectPath, "node_modules", ".bin", "prisma");
     const prismaBin = fs.existsSync(localPrisma) ? localPrisma : "npx prisma";
