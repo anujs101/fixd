@@ -235,4 +235,55 @@ describe("proposeAndApply and applyPatch", () => {
     const lastBackup = readFileSync(join(tmpDir, ".fixd/last-backup"), "utf-8").trim();
     expect(readdirSync(lastBackup)).toEqual(["a.ts"]);
   });
+
+  test("DELETE on session-created file is blocked (regression prevention)", async () => {
+    // Create a file through the patcher
+    const createResult = await applyPatch(
+      { op: "create", path: "new-file.ts", content: "declare module 'x' {}" },
+      tmpDir,
+    );
+    expect(createResult.applied).toBe(true);
+    expect(existsSync(join(tmpDir, "new-file.ts"))).toBe(true);
+
+    // Now try to delete it — should be blocked
+    const deleteResult = await applyPatch(
+      { op: "delete", path: "new-file.ts" },
+      tmpDir,
+    );
+    expect(deleteResult.applied).toBe(false);
+    expect(deleteResult.error).toContain("cannot delete file created in this session");
+    expect(existsSync(join(tmpDir, "new-file.ts"))).toBe(true); // file still exists
+  });
+
+  test("DELETE on pre-existing file (not session-created) is allowed", async () => {
+    // Create a file OUTSIDE the patcher (simulating a file that existed before the session)
+    writeFileSync(join(tmpDir, "existing.ts"), "original content", "utf-8");
+
+    const deleteResult = await applyPatch(
+      { op: "delete", path: "existing.ts" },
+      tmpDir,
+    );
+    expect(deleteResult.applied).toBe(true);
+    expect(existsSync(join(tmpDir, "existing.ts"))).toBe(false);
+  });
+
+  test("resetBackupSession clears session-created files tracking", async () => {
+    // Create a file through the patcher
+    await applyPatch(
+      { op: "create", path: "session-file.ts", content: "test" },
+      tmpDir,
+    );
+    expect(existsSync(join(tmpDir, "session-file.ts"))).toBe(true);
+
+    // Reset the session
+    resetBackupSession();
+
+    // Now deleting should be allowed (no longer tracked as session-created)
+    const deleteResult = await applyPatch(
+      { op: "delete", path: "session-file.ts" },
+      tmpDir,
+    );
+    expect(deleteResult.applied).toBe(true);
+    expect(existsSync(join(tmpDir, "session-file.ts"))).toBe(false);
+  });
 });

@@ -8,6 +8,7 @@
 import chalk from "chalk";
 import path from "node:path";
 import fs from "node:fs";
+import { execa } from "execa";
 import { sendMessage, disconnect, setActiveProject, primeContext } from "./lib/agent.js";
 import { proposeAndApply, resetBackupSession, clearNormalizedPatchHistory } from "./lib/patcher.js";
 import { readRelevantFiles } from "./lib/projectReader.js";
@@ -145,6 +146,41 @@ function formatHypothesesBlock(hypotheses: Hypothesis[]): string {
     return ["--- SESSION HYPOTHESES ---", ...hypotheses.map((h, i) => `${i + 1}. ${h.claim} → fixed: ${h.fix} → ${h.outcome}`), "--- END SESSION HYPOTHESES ---"].join("\n");
 }
 
+/**
+ * Detect when 2+ consecutive no_change outcomes target the same file/error.
+ * Returns an escalation prompt if detected, empty string otherwise.
+ */
+function detectEscalation(hypotheses: Hypothesis[], detectedIssues: DetectedIssue[]): string {
+    const noChanges = hypotheses.filter(h => h.outcome === "no_change");
+    if (noChanges.length < 2) return "";
+
+    const lastTwo = noChanges.slice(-2);
+    // Extract file paths from fix descriptions (comma-separated)
+    const filesA = new Set(lastTwo[0].fix.split(", ").map(f => f.trim()).filter(Boolean));
+    const filesB = new Set(lastTwo[1].fix.split(", ").map(f => f.trim()).filter(Boolean));
+    // Check overlap — same file targeted in both attempts
+    const overlap = [...filesA].filter(f => filesB.has(f));
+    if (overlap.length === 0) return "";
+
+    // Check if remaining issues include TS errors on the overlapping files
+    const tsIssues = detectedIssues.filter(i =>
+        i.type.includes("TYPESCRIPT") || i.type.includes("TS7016") ||
+        i.type.includes("MISSING_TYPES_PACKAGE") || i.type.includes("DECLARATION_NOT_INCLUDED")
+    );
+    const relevantIssues = tsIssues.length > 0 ? tsIssues : detectedIssues;
+
+    const errorCodes = [...new Set(relevantIssues.map(i => i.type))].join(", ");
+    const overlapList = overlap.join(", ");
+
+    return [
+        `[ESCALATION: 2 fix attempts to ${overlapList} produced NO CHANGE for ${errorCodes}.`,
+        `The file content may be correct but not discoverable.`,
+        `DIAGNOSE TSCONFIG: check tsconfig.json's "include", "files", and "typeRoots" —`,
+        `the file may exist with correct content but be outside tsc's compilation scope.`,
+        `DO NOT rewrite the same file again. DO NOT delete it.]`,
+    ].join("\n");
+}
+
 function getErrorTypeFormatInstruction(userMessage: string, detectedIssues: DetectedIssue[]): string {
     const types = detectedIssues.map(i => i.type);
     if (types.includes("MISSING_DATABASE_URL") || types.includes("PRISMA_POOLED_WITHOUT_DIRECT_URL")) return "FORMAT: Output ONLY <<<WRITE: .env>>> or <<<EDIT: prisma/schema.prisma>>> patch markers. Zero prose.";
@@ -164,9 +200,42 @@ function generateStuckReport(state: SessionState, remaining: DetectedIssue[]): s
 
 async function computeFixOutcome(projectRoot: string, issuesBefore: DetectedIssue[]): Promise<{ outcome: "resolved" | "no_change" | "regression"; delta: number; newIssues: DetectedIssue[] }> {
     const newScan = await scanProject(projectRoot).catch(() => null);
-    const newIssues = newScan ? detectIssues(newScan, projectRoot) : issuesBefore;
-    const delta = issuesBefore.length - newIssues.length;
-    return { outcome: delta > 0 ? "resolved" : delta < 0 ? "regression" : "no_change", delta, newIssues };
+    const baseIssues = newScan ? detectIssues(newScan, projectRoot) : issuesBefore;
+
+    // Also count TS errors from tsc --noEmit so TS fix outcomes are visible.
+    // detectIssues() only covers PORT_CONFLICT and NODE_VERSION_MISMATCH —
+    // without this, every TS fix reports "NO CHANGE" in the agenticTurn loop.
+    let tsErrorCount = 0;
+    try {
+        const tscBin = path.join(projectRoot, "node_modules", ".bin", "tsc");
+        const tsc = fs.existsSync(tscBin) ? tscBin : "tsc";
+        const { stdout, stderr } = await execa(tsc, ["--noEmit"], {
+            cwd: projectRoot, reject: false, timeout: 30_000,
+        });
+        const out = (stdout ?? "") + "\n" + (stderr ?? "");
+        const tsRe = /^[^(\n]+\(\d+,\d+\):\s+error\s+TS\d+:/gm;
+        const matches = out.match(tsRe);
+        tsErrorCount = matches ? matches.length : 0;
+    } catch {
+        // tsc unavailable — don't affect outcome
+    }
+
+    // Merge: base issues + TS errors counted as synthetic DetectedIssue entries
+    const totalBefore = issuesBefore.length + (issuesBefore.some(i => i.type.includes("TYPESCRIPT") || i.type.includes("TS")) ? 0 : 0);
+    // We can't easily know the before-count of TS errors, so use a simpler heuristic:
+    // If tsErrorCount is 0 and the fix touched a .d.ts or tsconfig file, count it as progress.
+    const newIssues = [...baseIssues];
+    const delta = issuesBefore.length - baseIssues.length + (tsErrorCount === 0 && issuesBefore.length === baseIssues.length ? 0 : 0);
+    // Simplified: use total before/after by injecting TS error count
+    const effectiveBefore = issuesBefore.length;
+    const effectiveAfter = baseIssues.length + tsErrorCount;
+    const effectiveDelta = effectiveBefore - effectiveAfter;
+
+    return {
+        outcome: effectiveDelta > 0 ? "resolved" : effectiveDelta < 0 ? "regression" : "no_change",
+        delta: effectiveDelta,
+        newIssues,
+    };
 }
 
 async function agenticTurn(
@@ -250,8 +319,9 @@ async function agenticTurn(
                 currentMemory = recordStackPattern(currentMemory, currentMemory.knownStack, ai[0] ?? "UNKNOWN", claim.slice(0, 120), outcome === "resolved" ? "success" : "failure");
             }
 
+            const escalation = outcome === "no_change" ? detectEscalation(state.hypotheses, newIssues) : "";
             const msg = outcome === "resolved" ? `[Fix Outcome: FIXED — ${Math.abs(delta)} resolved]` :
-                outcome === "no_change" ? `[Fix Outcome: NO CHANGE]\n${formatHypothesesBlock(state.hypotheses)}\nTry different approach.` :
+                outcome === "no_change" ? `[Fix Outcome: NO CHANGE]\n${formatHypothesesBlock(state.hypotheses)}\n${escalation || "Try different approach."}` :
                     `[Fix Outcome: REGRESSION — ${Math.abs(delta)} new issues]\nReassess.`;
             await agenticTurn(msg, projectRoot, depth + 1, state, alreadyRan, projectLibraries, sessionLog, sessionChangedFiles, newIssues, currentMemory);
             return;

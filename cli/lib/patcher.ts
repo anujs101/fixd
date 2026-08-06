@@ -68,6 +68,12 @@ function assertWithinRoot(abs: string, projectRoot: string, opPath: string): str
 
 let _sessionBackupDir: string | null = null;
 
+// ─── Session-created file tracking (Fix: regression prevention) ──────────────
+// Files created during this session. Delete operations targeting these files
+// are blocked — the agent cannot delete a file it created earlier in the same
+// session as a "fix" for the file not working.
+const _sessionCreatedFiles = new Set<string>();
+
 function getSessionBackupDir(projectRoot: string): string {
     if (!_sessionBackupDir) {
         const ts = new Date().toISOString().replace(/[:.]/g, "-");
@@ -483,12 +489,14 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
                     await fs.mkdir(path.dirname(abs), { recursive: true });
                     await atomicWrite(abs, op.content);
                     markNormalizedApplied(op);
+                    _sessionCreatedFiles.add(abs);
                     const diff = prefixLines(op.content.split("\n"), "+ ");
                     return { op: "create", path: op.path, applied: true, diff };
                 }
                 await fs.mkdir(path.dirname(abs), { recursive: true });
                 await atomicWrite(abs, op.content);
                 markNormalizedApplied(op);
+                _sessionCreatedFiles.add(abs);
                 const diff = prefixLines(op.content.split("\n"), "+ ");
                 return { op: "create", path: op.path, applied: true, diff };
             }
@@ -504,6 +512,11 @@ export async function applyPatch(op: PatchOperation, projectRoot: string): Promi
             }
 
             case "delete": {
+                // Regression prevention: block deletion of files created in this session
+                if (_sessionCreatedFiles.has(abs)) {
+                    return { op: "delete", path: op.path, applied: false, diff: "",
+                        error: "Blocked: cannot delete file created in this session (regression prevention)" };
+                }
                 let content = "";
                 try { content = await fs.readFile(abs, "utf-8"); } catch { /* gone already */ }
                 await backupFile(abs, projectRoot);
@@ -668,4 +681,5 @@ export async function proposeAndApply(
 
 export function resetBackupSession(): void {
     _sessionBackupDir = null;
+    _sessionCreatedFiles.clear();
 }
